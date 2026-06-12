@@ -1,0 +1,11 @@
+data_root: /home1/lzh/dataset
+dataset: smoke
+pred_len: 96
+lookback: 24
+seed: 0
+tier: smoke
+split_ratios: [0.6, 0.2, 0.2]
+stability_blocks: 3
+alpha_grid: [0.001, 0.01, 0.1, 1.0, 10.0]
+null_method: phase
+B: 20
