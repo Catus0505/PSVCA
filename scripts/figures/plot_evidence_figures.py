@@ -30,7 +30,7 @@ def _style() -> None:
             "axes.facecolor": "white",
             "axes.spines.top": False,
             "axes.spines.right": False,
-            "axes.grid": True,
+            "axes.grid": False,
             "grid.alpha": 0.22,
             "savefig.facecolor": "white",
         }
@@ -66,7 +66,8 @@ def plot_fig1(input_root: Path, output_dir: Path, tier: str) -> None:
     fpr = float(p_summary["empirical_fpr_005"].iloc[0])
     decoy_failed = bool(r_summary["decoy_oracle_failed"].iloc[0])
 
-    fig, axes = plt.subplots(1, 2, figsize=(13.0, 5.2), constrained_layout=True)
+    fig, axes = plt.subplots(1, 2, figsize=(13.2, 5.1))
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.84, bottom=0.20, wspace=0.26)
     ax = axes[0]
     colors = ["#2F6B4F", "#6F7785", "#B36B2C"]
     ax.bar(rates.index, rates.to_numpy(dtype=float), color=colors, width=0.64)
@@ -78,11 +79,11 @@ def plot_fig1(input_root: Path, output_dir: Path, tier: str) -> None:
         ax.text(idx, rate + 0.01, f"n={int(counts[label])}", ha="center", va="bottom", fontsize=9)
     ax.text(
         0.0,
-        -0.25,
-        f"pairwise candidate, no FDR/stability yet; tier={tier}, B={B}; "
-        f"decoy oracle failed={decoy_failed}",
+        -0.18,
+        f"tier={tier}, B={B}; pairwise candidate, no FDR/stability yet\n"
+        f"no test split used for certification; decoy oracle failed={decoy_failed}",
         transform=ax.transAxes,
-        fontsize=9,
+        fontsize=8.5,
     )
 
     ax = axes[1]
@@ -101,8 +102,8 @@ def plot_fig1(input_root: Path, output_dir: Path, tier: str) -> None:
         0.82,
         f"KS p={ks_p:.3g}\nFPR@0.05={fpr:.3g}\nno test split used for certification",
         transform=ax.transAxes,
-        fontsize=10,
-        bbox={"facecolor": "white", "edgecolor": "#CCCCCC", "alpha": 0.9},
+        fontsize=9,
+        bbox={"facecolor": "white", "edgecolor": "#D6D6D6", "alpha": 0.9, "pad": 4},
     )
     fig.suptitle("Fig.1 Instrument validation", fontsize=15)
     _save(fig, output_dir, "fig1_instrument_validation")
@@ -115,6 +116,29 @@ def _matrix(df: pd.DataFrame, field: str) -> np.ndarray:
     for row in df.itertuples():
         mat[int(row.target), int(row.source)] = float(getattr(row, field))
     return mat
+
+
+def _short_summary_lines(text: str, *, limit: int = 3) -> list[str]:
+    if not isinstance(text, str) or not text or text == "nan":
+        return []
+    lines = []
+    for item in text.split("; ")[:limit]:
+        item = item.replace("coherence_peak=", "coh=")
+        item = item.replace("aligned_gain=", "gain=")
+        item = item.replace("diff=", "diff=")
+        lines.append(item)
+    return lines
+
+
+def _format_summary_box(s: pd.Series) -> str:
+    high_assoc = _short_summary_lines(str(s["top_high_association_rejected_edges"]))
+    asym = _short_summary_lines(str(s["top_direction_asymmetry_pairs"]))
+    lines = ["C. Summary: association != value", "", "High-association but rejected:"]
+    lines.extend(f"  - {line}" for line in high_assoc)
+    lines.append("")
+    lines.append("Direction asymmetry:")
+    lines.extend(f"  - {line}" for line in asym)
+    return "\n".join(lines)
 
 
 def plot_fig2(input_root: Path, output_dir: Path, tier: str, dataset: str, pred_len: int) -> None:
@@ -134,33 +158,48 @@ def plot_fig2(input_root: Path, output_dir: Path, tier: str, dataset: str, pred_
     gain = _matrix(df, "aligned_gain")
     candidate = _matrix(df, "certified_candidate")
 
-    fig = plt.figure(figsize=(14.0, 5.8), constrained_layout=True)
-    gs = fig.add_gridspec(1, 3, width_ratios=[1.0, 1.0, 1.35])
+    fig = plt.figure(figsize=(16.4, 8.8))
+    gs = fig.add_gridspec(
+        2,
+        3,
+        height_ratios=[3.7, 1.35],
+        width_ratios=[1.08, 1.08, 1.70],
+        hspace=0.34,
+        wspace=0.32,
+    )
+    fig.subplots_adjust(left=0.055, right=0.985, top=0.90, bottom=0.07)
     ax0 = fig.add_subplot(gs[0, 0])
     ax1 = fig.add_subplot(gs[0, 1])
     ax2 = fig.add_subplot(gs[0, 2])
+    ax3 = fig.add_subplot(gs[1, :])
 
     im0 = ax0.imshow(assoc, cmap="viridis", vmin=0.0, vmax=np.nanmax(assoc))
-    ax0.set_title("A1. Association matrix\npeak coherence")
+    ax0.set_title("A1. Association matrix (peak coherence)", fontsize=11, pad=10)
     ax0.set_xlabel("source")
     ax0.set_ylabel("target")
-    fig.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
+    ax0.set_xticks(np.arange(assoc.shape[1]))
+    ax0.set_yticks(np.arange(assoc.shape[0]))
+    fig.colorbar(im0, ax=ax0, fraction=0.050, pad=0.025)
 
     vmax = np.nanmax(np.abs(gain))
     vmax = vmax if np.isfinite(vmax) and vmax > 0 else 1.0
     im1 = ax1.imshow(gain, cmap="coolwarm", vmin=-vmax, vmax=vmax)
-    ax1.set_title("A2. Directed value matrix\naligned gain")
+    ax1.set_title("A2. Directed value matrix (aligned gain)", fontsize=11, pad=10)
     ax1.set_xlabel("source")
     ax1.set_ylabel("target")
+    ax1.set_xticks(np.arange(gain.shape[1]))
+    ax1.set_yticks(np.arange(gain.shape[0]))
     yy, xx = np.where(candidate == 1.0)
-    ax1.scatter(xx, yy, s=55, facecolors="none", edgecolors="black", linewidths=1.2)
-    fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+    ax1.scatter(xx, yy, s=78, facecolors="none", edgecolors="black", linewidths=1.4)
+    fig.colorbar(im1, ax=ax1, fraction=0.050, pad=0.025)
     ax1.text(
-        0.0,
-        -0.18,
-        "association is symmetric-ish; value is directed",
+        0.02,
+        0.02,
+        "association is near-symmetric;\nvalue is directed",
         transform=ax1.transAxes,
-        fontsize=9,
+        fontsize=8.5,
+        va="bottom",
+        bbox={"facecolor": "white", "edgecolor": "#D6D6D6", "alpha": 0.88, "pad": 3},
     )
 
     rejected = ~df["certified_candidate"].to_numpy(dtype=bool)
@@ -186,21 +225,32 @@ def plot_fig2(input_root: Path, output_dir: Path, tier: str, dataset: str, pred_
     ax2.set_xlabel("association foil: peak coherence")
     ax2.set_ylabel("aligned_gain")
     ax2.set_title("B. Association vs directed value")
+    ax2.grid(True, alpha=0.18)
     ax2.legend(frameon=False)
     ax2.text(
-        0.02,
-        0.98,
-        f"Spearman rho={float(s['spearman_coherence_peak_aligned_gain']):.3g}\n"
+        0.04,
+        0.96,
+        f"Spearman $\\rho$={float(s['spearman_coherence_peak_aligned_gain']):.3g}\n"
         f"tier={tier}, B={B}\nno test split used for certification\n"
         "pairwise candidate, no FDR/stability yet",
         transform=ax2.transAxes,
         va="top",
         fontsize=9,
-        bbox={"facecolor": "white", "edgecolor": "#CCCCCC", "alpha": 0.92},
+        bbox={"facecolor": "white", "edgecolor": "#D6D6D6", "alpha": 0.92, "pad": 4},
     )
-    note = str(s["top_high_association_rejected_edges"])
-    if note:
-        ax2.text(0.02, -0.27, f"High-association rejected: {note}", transform=ax2.transAxes, fontsize=8)
+
+    ax3.axis("off")
+    ax3.text(
+        0.01,
+        0.96,
+        _format_summary_box(s),
+        transform=ax3.transAxes,
+        va="top",
+        ha="left",
+        fontsize=9.2,
+        linespacing=1.22,
+        bbox={"facecolor": "#FAFAFA", "edgecolor": "#CFCFCF", "alpha": 1.0, "pad": 8},
+    )
     fig.suptitle(f"Fig.2 Value vs association ({dataset}, pred_len={pred_len})", fontsize=15)
     _save(fig, output_dir, "fig2_value_vs_association")
     plt.close(fig)
