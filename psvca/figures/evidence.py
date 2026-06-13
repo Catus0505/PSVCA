@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import TypeVar
 
 import numpy as np
 import pandas as pd
@@ -11,6 +14,9 @@ from scipy.stats import spearmanr
 from psvca.certify.probe import PairwiseProbeConfig, PairwiseProbeResult, probe_pairwise
 from psvca.linalg.design import DesignMatrix, make_lagged_design
 from psvca.nulls.phase_surrogate import make_phase_surrogate
+
+T = TypeVar("T")
+U = TypeVar("U")
 
 
 @dataclass(frozen=True)
@@ -30,6 +36,16 @@ def ensure_dir(path: str | Path) -> Path:
     out = Path(path)
     out.mkdir(parents=True, exist_ok=True)
     return out
+
+
+def ordered_parallel_map(fn: Callable[[T], U], tasks: Iterable[T], n_jobs: int) -> list[U]:
+    task_list = list(tasks)
+    if n_jobs <= 0:
+        raise ValueError("n_jobs must be positive")
+    if n_jobs == 1 or len(task_list) <= 1:
+        return [fn(task) for task in task_list]
+    with ProcessPoolExecutor(max_workers=n_jobs) as pool:
+        return list(pool.map(fn, task_list))
 
 
 def ar1_series(rng: np.random.Generator, n: int, phi: float, scale: float = 1.0) -> np.ndarray:

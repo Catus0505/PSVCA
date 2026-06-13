@@ -17,6 +17,7 @@ from psvca.figures.evidence import (
     coherence_features,
     ensure_dir,
     finite_spearman,
+    ordered_parallel_map,
     probe_value_pair,
     result_record,
     top_direction_asymmetry,
@@ -26,12 +27,57 @@ from psvca.figures.evidence import (
 )
 
 
+def _run_real_pair(task) -> dict:
+    (
+        target,
+        source,
+        task_id,
+        values,
+        splits,
+        lookback,
+        pred_len,
+        B,
+        base_seed,
+        alphas,
+        dataset,
+        tier,
+    ) = task
+    pre = values[splits.pre_test.start : splits.pre_test.end]
+    c_mean, c_peak = coherence_features(pre[:, target], pre[:, source])
+    xcorr = xcorr_absmax(pre[:, target], pre[:, source], max_lag=min(48, lookback))
+    result = probe_value_pair(
+        values,
+        target=target,
+        source=source,
+        splits=splits,
+        lookback=lookback,
+        horizon=pred_len,
+        B=B,
+        seed=base_seed + 1000003 * task_id,
+        alphas=tuple(alphas),
+        dataset=dataset,
+    )
+    row = result_record(result)
+    row.update(
+        dataset=dataset,
+        pred_len=pred_len,
+        tier=tier,
+        seed=base_seed,
+        B=B,
+        coherence_mean=c_mean,
+        coherence_peak=c_peak,
+        xcorr_absmax=xcorr,
+    )
+    return row
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--tier", choices=("smoke", "formal"), required=True)
     parser.add_argument("--B", type=int, required=True)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--n-jobs", type=int, default=1)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -41,43 +87,33 @@ def main() -> None:
     if n_channels > 10:
         raise SystemExit(f"Fig.2 exact pairwise evidence is restricted to n_channels <= 10; got {n_channels}")
 
-    rows = []
-    pre = values[loaded.splits.pre_test.start : loaded.splits.pre_test.end]
-    for target in range(n_channels):
-        for source in range(n_channels):
-            if target == source:
-                continue
-            c_mean, c_peak = coherence_features(pre[:, target], pre[:, source])
-            xcorr = xcorr_absmax(pre[:, target], pre[:, source], max_lag=min(48, cfg.lookback))
-            result = probe_value_pair(
-                values,
-                target=target,
-                source=source,
-                splits=loaded.splits,
-                lookback=cfg.lookback,
-                horizon=cfg.pred_len,
-                B=args.B,
-                seed=args.seed + 7919 * target + 104729 * source,
-                alphas=cfg.alpha_grid,
-                dataset=cfg.dataset,
-            )
-            row = result_record(result)
-            row.update(
-                dataset=cfg.dataset,
-                pred_len=cfg.pred_len,
-                tier=args.tier,
-                seed=args.seed,
-                B=args.B,
-                coherence_mean=c_mean,
-                coherence_peak=c_peak,
-                xcorr_absmax=xcorr,
-            )
-            rows.append(row)
-            print(
-                f"{target}<-{source} coherence_peak={c_peak:.6g} "
-                f"aligned={result.aligned_gain:.6g} p={result.p_value:.6g} "
-                f"candidate={result.certified_candidate}"
-            )
+    pairs = [(target, source) for target in range(n_channels) for source in range(n_channels) if target != source]
+    tasks = [
+        (
+            target,
+            source,
+            task_id,
+            values,
+            loaded.splits,
+            cfg.lookback,
+            cfg.pred_len,
+            args.B,
+            args.seed,
+            cfg.alpha_grid,
+            cfg.dataset,
+            args.tier,
+        )
+        for task_id, (target, source) in enumerate(pairs)
+    ]
+    rows = ordered_parallel_map(_run_real_pair, tasks, args.n_jobs)
+    rows = sorted(rows, key=lambda row: (int(row["target"]), int(row["source"])))
+    for row in rows:
+        print(
+            f"{int(row['target'])}<-{int(row['source'])} "
+            f"coherence_peak={float(row['coherence_peak']):.6g} "
+            f"aligned={float(row['aligned_gain']):.6g} p={float(row['p_value']):.6g} "
+            f"candidate={bool(row['certified_candidate'])}"
+        )
 
     out_dir = ensure_dir("runs/figures")
     df = pd.DataFrame(rows)

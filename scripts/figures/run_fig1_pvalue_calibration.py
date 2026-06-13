@@ -15,11 +15,33 @@ if str(REPO_ROOT) not in sys.path:
 from psvca.figures.evidence import (
     ensure_dir,
     null_pair_values,
+    ordered_parallel_map,
     probe_value_pair,
     result_record,
     standard_splits,
     write_tsv,
 )
+
+
+def _run_null_pair(task: tuple[int, int, int, int, str]) -> dict:
+    pair_id, base_seed, n, B, tier = task
+    pair_seed = base_seed + 1000003 * pair_id
+    values = null_pair_values(pair_seed, n)
+    result = probe_value_pair(
+        values,
+        target=0,
+        source=1,
+        splits=standard_splits(n),
+        lookback=5,
+        horizon=1,
+        B=B,
+        seed=pair_seed,
+        alphas=(0.1, 1.0, 10.0, 100.0),
+        dataset=f"fig1_null_{tier}",
+    )
+    row = result_record(result)
+    row.update(tier=tier, seed=base_seed, pair_id=pair_id, B=B)
+    return row
 
 
 def main() -> None:
@@ -28,33 +50,18 @@ def main() -> None:
     parser.add_argument("--B", type=int, required=True)
     parser.add_argument("--n-null", type=int, required=True)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--n-jobs", type=int, default=1)
     args = parser.parse_args()
 
     n = 260 if args.tier == "smoke" else 900
-    lookback = 5
-    horizon = 1
-    alphas = (0.1, 1.0, 10.0, 100.0)
-    splits = standard_splits(n)
-    rows = []
-    for pair_id in range(args.n_null):
-        pair_seed = args.seed + 1009 * pair_id
-        values = null_pair_values(pair_seed, n)
-        result = probe_value_pair(
-            values,
-            target=0,
-            source=1,
-            splits=splits,
-            lookback=lookback,
-            horizon=horizon,
-            B=args.B,
-            seed=pair_seed,
-            alphas=alphas,
-            dataset=f"fig1_null_{args.tier}",
+    tasks = [(pair_id, args.seed, n, args.B, args.tier) for pair_id in range(args.n_null)]
+    rows = ordered_parallel_map(_run_null_pair, tasks, args.n_jobs)
+    rows = sorted(rows, key=lambda row: int(row["pair_id"]))
+    for row in rows:
+        print(
+            f"pair_id={int(row['pair_id'])} p={float(row['p_value']):.6g} "
+            f"candidate={bool(row['certified_candidate'])}"
         )
-        row = result_record(result)
-        row.update(tier=args.tier, seed=args.seed, pair_id=pair_id, B=args.B)
-        rows.append(row)
-        print(f"pair_id={pair_id} p={result.p_value:.6g} candidate={result.certified_candidate}")
 
     out_dir = ensure_dir("runs/figures")
     df = pd.DataFrame(rows)

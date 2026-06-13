@@ -13,6 +13,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from psvca.figures.evidence import (
     ensure_dir,
+    ordered_parallel_map,
     probe_value_pair,
     recovery_edge_list,
     recovery_values,
@@ -22,46 +23,53 @@ from psvca.figures.evidence import (
 )
 
 
+def _run_recovery_edge(task: tuple[int, int, int, str, int, str, int]) -> dict:
+    target, source, task_id, edge_type, base_seed, tier, B = task
+    n = 360 if tier == "smoke" else 1400
+    values = recovery_values(base_seed, n=n, n_channels=10)
+    result = probe_value_pair(
+        values,
+        target=target,
+        source=source,
+        splits=standard_splits(n),
+        lookback=6,
+        horizon=1,
+        B=B,
+        seed=base_seed + 1000003 * task_id,
+        alphas=(0.1, 1.0, 10.0, 100.0),
+        dataset=f"fig1_recovery_{tier}",
+    )
+    row = result_record(result)
+    row.update(
+        tier=tier,
+        seed=base_seed,
+        B=B,
+        edge_type=edge_type,
+        admitted_candidate=bool(result.certified_candidate and result.p_value <= 0.10),
+        oracle_incremental_r2=float(result.delta_true),
+    )
+    return row
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tier", choices=("smoke", "formal"), required=True)
     parser.add_argument("--B", type=int, required=True)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--n-jobs", type=int, default=1)
     args = parser.parse_args()
 
-    n = 360 if args.tier == "smoke" else 1400
-    values = recovery_values(args.seed, n=n, n_channels=10)
-    splits = standard_splits(n)
-    lookback = 6
-    horizon = 1
-    alphas = (0.1, 1.0, 10.0, 100.0)
-    rows = []
-    for target, source, edge_type in recovery_edge_list():
-        result = probe_value_pair(
-            values,
-            target=target,
-            source=source,
-            splits=splits,
-            lookback=lookback,
-            horizon=horizon,
-            B=args.B,
-            seed=args.seed + 7919 * target + 104729 * source,
-            alphas=alphas,
-            dataset=f"fig1_recovery_{args.tier}",
-        )
-        row = result_record(result)
-        row.update(
-            tier=args.tier,
-            seed=args.seed,
-            B=args.B,
-            edge_type=edge_type,
-            admitted_candidate=bool(result.certified_candidate and result.p_value <= 0.10),
-            oracle_incremental_r2=float(result.delta_true),
-        )
-        rows.append(row)
+    tasks = [
+        (target, source, task_id, edge_type, args.seed, args.tier, args.B)
+        for task_id, (target, source, edge_type) in enumerate(recovery_edge_list())
+    ]
+    rows = ordered_parallel_map(_run_recovery_edge, tasks, args.n_jobs)
+    rows = sorted(rows, key=lambda row: (int(row["target"]), int(row["source"])))
+    for row in rows:
         print(
-            f"{edge_type} {target}<-{source} delta={result.delta_true:.6g} "
-            f"aligned={result.aligned_gain:.6g} p={result.p_value:.6g} "
+            f"{row['edge_type']} {int(row['target'])}<-{int(row['source'])} "
+            f"delta={float(row['delta_true']):.6g} "
+            f"aligned={float(row['aligned_gain']):.6g} p={float(row['p_value']):.6g} "
             f"admitted={row['admitted_candidate']}"
         )
 
