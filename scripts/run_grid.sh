@@ -2,7 +2,7 @@
 set -u   # 故意不开 -e:单个 config 失败不能中断整夜的批处理
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
-NJOBS="${NJOBS:-36}"
+NJOBS="${NJOBS:-24}"
 TIER="${TIER:-formal}"
 
 case "${1:-}" in
