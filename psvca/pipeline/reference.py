@@ -20,7 +20,9 @@ from psvca.linalg.design import make_lagged_design
 from psvca.nulls.phase_surrogate import make_phase_surrogate
 
 
-MAX_EXACT_N = 10
+# Weather N=21 is allowed for exact all-pair reference. ECL N=321 and
+# Traffic N=862 exceed this cap and must use screen_certify (dead rule 2).
+MAX_EXACT_N = 32
 
 
 def _bounds(split) -> tuple[int, int]:
