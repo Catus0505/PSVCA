@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 
 from psvca.base.innovation import compute_innovation_for_target
+from psvca.certify.probe import normalize_n_jobs
 from psvca.linalg.design import make_lagged_design
 from psvca.linalg.svd_ridge import fit_ridge_path
 
@@ -17,6 +19,7 @@ class ValueScreenConfig:
     targets: tuple[int, ...] | None = None
     seed: int = 0
     alpha_rule: str = "val_grid"
+    n_jobs: int = 1
 
 
 @dataclass(frozen=True)
@@ -98,6 +101,73 @@ def _residual_oos_r2(y_true: np.ndarray, pred: np.ndarray, *, variance_eps: floa
     return 1.0 - sse / sst
 
 
+def _screen_target(
+    *,
+    values: np.ndarray,
+    channels: tuple[str, ...],
+    splits,
+    target: int,
+    lookback: int,
+    horizon: int,
+    alphas: np.ndarray,
+    config: ValueScreenConfig,
+) -> list[dict]:
+    n_channels = values.shape[1]
+    innovation = compute_innovation_for_target(
+        values=values,
+        channels=channels,
+        splits=splits,
+        target=target,
+        lookback=lookback,
+        horizon=horizon,
+        alphas=alphas,
+        seed=config.seed,
+    )
+    target_rows: list[dict] = []
+    for source in range(n_channels):
+        if source == target:
+            continue
+        source_train = _source_design(values, target, source, splits.train_fit, lookback, horizon)
+        source_val = _source_design(values, target, source, splits.val_alpha, lookback, horizon)
+        source_cert = _source_design(values, target, source, splits.cert, lookback, horizon)
+        path, alpha = _fit_alpha(
+            X_train=source_train.X,
+            y_train=innovation.resid_train_fit,
+            X_val=source_val.X,
+            y_val=innovation.resid_val_alpha,
+            alphas=alphas,
+            alpha_rule=config.alpha_rule,
+        )
+        pred_cert = path.predict(source_cert.X, alpha)
+        score = _residual_oos_r2(innovation.resid_cert, pred_cert)
+        target_rows.append(
+            {
+                "target": int(target),
+                "source": int(source),
+                "s_screen": float(score),
+                "screen_rank": 0,
+                "passed_screen": False,
+                "n_train_fit": int(len(innovation.resid_train_fit)),
+                "n_val_alpha": int(len(innovation.resid_val_alpha)),
+                "n_cert": int(len(innovation.resid_cert)),
+                "alpha_screen": float(alpha),
+                "alpha_rule": config.alpha_rule,
+            }
+        )
+
+    target_rows.sort(
+        key=lambda row: (
+            not np.isfinite(row["s_screen"]),
+            -row["s_screen"] if np.isfinite(row["s_screen"]) else np.inf,
+            row["source"],
+        )
+    )
+    for rank, row in enumerate(target_rows, start=1):
+        row["screen_rank"] = int(rank)
+        row["passed_screen"] = bool(rank <= config.top_m and np.isfinite(row["s_screen"]))
+    return target_rows
+
+
 def run_value_screen(
     *,
     values: np.ndarray,
@@ -124,62 +194,28 @@ def run_value_screen(
 
     n_channels = arr.shape[1]
     targets = _select_targets(n_channels, cfg)
-    rows: list[dict] = []
+    resolved_n_jobs = normalize_n_jobs(cfg.n_jobs)
+    tasks = [
+        {
+            "values": arr,
+            "channels": channels,
+            "splits": splits,
+            "target": target,
+            "lookback": lookback,
+            "horizon": horizon,
+            "alphas": alpha_arr,
+            "config": cfg,
+        }
+        for target in targets
+    ]
+    if resolved_n_jobs == 1 or len(tasks) == 1:
+        target_results = [_screen_target(**task) for task in tasks]
+    else:
+        with ProcessPoolExecutor(max_workers=min(resolved_n_jobs, len(tasks))) as executor:
+            target_results = list(executor.map(_screen_target_from_task, tasks))
 
-    for target in targets:
-        innovation = compute_innovation_for_target(
-            values=arr,
-            channels=channels,
-            splits=splits,
-            target=target,
-            lookback=lookback,
-            horizon=horizon,
-            alphas=alpha_arr,
-            seed=cfg.seed,
-        )
-        target_rows: list[dict] = []
-        for source in range(n_channels):
-            if source == target:
-                continue
-            source_train = _source_design(arr, target, source, splits.train_fit, lookback, horizon)
-            source_val = _source_design(arr, target, source, splits.val_alpha, lookback, horizon)
-            source_cert = _source_design(arr, target, source, splits.cert, lookback, horizon)
-            path, alpha = _fit_alpha(
-                X_train=source_train.X,
-                y_train=innovation.resid_train_fit,
-                X_val=source_val.X,
-                y_val=innovation.resid_val_alpha,
-                alphas=alpha_arr,
-                alpha_rule=cfg.alpha_rule,
-            )
-            pred_cert = path.predict(source_cert.X, alpha)
-            score = _residual_oos_r2(innovation.resid_cert, pred_cert)
-            target_rows.append(
-                {
-                    "target": int(target),
-                    "source": int(source),
-                    "s_screen": float(score),
-                    "screen_rank": 0,
-                    "passed_screen": False,
-                    "n_train_fit": int(len(innovation.resid_train_fit)),
-                    "n_val_alpha": int(len(innovation.resid_val_alpha)),
-                    "n_cert": int(len(innovation.resid_cert)),
-                    "alpha_screen": float(alpha),
-                    "alpha_rule": cfg.alpha_rule,
-                }
-            )
-
-        target_rows.sort(
-            key=lambda row: (
-                not np.isfinite(row["s_screen"]),
-                -row["s_screen"] if np.isfinite(row["s_screen"]) else np.inf,
-                row["source"],
-            )
-        )
-        for rank, row in enumerate(target_rows, start=1):
-            row["screen_rank"] = int(rank)
-            row["passed_screen"] = bool(rank <= cfg.top_m and np.isfinite(row["s_screen"]))
-            rows.append(row)
+    rows = [row for target_rows in target_results for row in target_rows]
+    rows.sort(key=lambda row: (row["target"], row["screen_rank"], row["source"]))
 
     edges = pd.DataFrame(rows)
     summary = {
@@ -187,5 +223,10 @@ def run_value_screen(
         "top_m": int(cfg.top_m),
         "n_screen_edges": int(edges["passed_screen"].sum()) if not edges.empty else 0,
         "alpha_rule": cfg.alpha_rule,
+        "n_jobs": int(resolved_n_jobs),
     }
     return ValueScreenResult(edges=edges, summary=summary)
+
+
+def _screen_target_from_task(task: dict) -> list[dict]:
+    return _screen_target(**task)

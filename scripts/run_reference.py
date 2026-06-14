@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import os
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 import sys
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import numpy as np
 import pandas as pd
@@ -12,12 +20,21 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from psvca.certify.probe import PairwiseProbeConfig, probe_pairwise
+from psvca.certify.probe import PairwiseProbeConfig, normalize_n_jobs, probe_pairwise
 from psvca.config import load_config
 from psvca.data.loader import load_series
 from psvca.io.artifacts import ensure_run_dir, make_run_id
 from psvca.linalg.design import make_lagged_design
 from psvca.nulls.phase_surrogate import make_phase_surrogate
+
+
+BLAS_THREADS_POLICY = {
+    "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS"),
+    "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS"),
+    "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS"),
+    "VECLIB_MAXIMUM_THREADS": os.environ.get("VECLIB_MAXIMUM_THREADS"),
+    "NUMEXPR_NUM_THREADS": os.environ.get("NUMEXPR_NUM_THREADS"),
+}
 
 
 def _bounds(split) -> tuple[int, int]:
@@ -96,16 +113,58 @@ def _row(result) -> dict:
     return data
 
 
+def _run_pairwise_edge_task(task: dict) -> dict:
+    values = task["values"]
+    cfg = task["cfg"]
+    splits = task["splits"]
+    target = int(task["target"])
+    source = int(task["source"])
+    own_train = _own_design(values, target, splits.train_fit, cfg.lookback, cfg.pred_len)
+    own_val = _own_design(values, target, splits.val_alpha, cfg.lookback, cfg.pred_len)
+    own_cert = _own_design(values, target, splits.cert, cfg.lookback, cfg.pred_len)
+    source_train = _source_design(values, target, source, splits.train_fit, cfg.lookback, cfg.pred_len)
+    source_val = _source_design(values, target, source, splits.val_alpha, cfg.lookback, cfg.pred_len)
+    source_cert = _source_design(values, target, source, splits.cert, cfg.lookback, cfg.pred_len)
+    result = probe_pairwise(
+        target=target,
+        source=source,
+        y_train=own_train.y,
+        y_val=own_val.y,
+        y_cert=own_cert.y,
+        own_train=own_train.X,
+        own_val=own_val.X,
+        own_cert=own_cert.X,
+        source_train=source_train.X,
+        source_val=source_val.X,
+        source_cert=source_cert.X,
+        surrogate_bank=_surrogate_bank(
+            values,
+            target=target,
+            source=source,
+            splits=splits,
+            lookback=cfg.lookback,
+            horizon=cfg.pred_len,
+            B=cfg.B,
+            seed=cfg.seed,
+            dataset=cfg.dataset,
+        ),
+        config=task["probe_cfg"],
+    )
+    return _row(result)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--tier", required=True)
+    parser.add_argument("--n-jobs", type=int, default=1)
     args = parser.parse_args()
 
     if args.tier != "sanity":
         raise SystemExit("Phase 4 reference only supports --tier sanity")
     cfg = load_config(args.config)
     loaded = load_series(cfg)
+    n_jobs = normalize_n_jobs(args.n_jobs)
     n_channels = loaded.values.shape[1]
     if n_channels > 10:
         raise SystemExit(
@@ -119,60 +178,31 @@ def main() -> None:
         null_method="phase",
         alpha_rule="val_grid",
     )
-    own_by_target = {}
-    rows = []
-    for target in range(n_channels):
-        own_by_target[target] = (
-            _own_design(loaded.values, target, loaded.splits.train_fit, cfg.lookback, cfg.pred_len),
-            _own_design(loaded.values, target, loaded.splits.val_alpha, cfg.lookback, cfg.pred_len),
-            _own_design(loaded.values, target, loaded.splits.cert, cfg.lookback, cfg.pred_len),
+    tasks = [
+        {
+            "values": loaded.values,
+            "splits": loaded.splits,
+            "cfg": cfg,
+            "probe_cfg": probe_cfg,
+            "target": target,
+            "source": source,
+        }
+        for target in range(n_channels)
+        for source in range(n_channels)
+        if source != target
+    ]
+    if n_jobs == 1 or len(tasks) <= 1:
+        rows = [_run_pairwise_edge_task(task) for task in tasks]
+    else:
+        with ProcessPoolExecutor(max_workers=min(n_jobs, len(tasks))) as executor:
+            rows = list(executor.map(_run_pairwise_edge_task, tasks))
+    rows.sort(key=lambda row: (row["target"], row["source"]))
+    for row in rows:
+        print(
+            f"target={row['target']} source={row['source']} delta={row['delta_true']:.6g} "
+            f"aligned={row['aligned_gain']:.6g} p={row['p_value']:.6g} "
+            f"candidate={row['certified_candidate']}"
         )
-
-    for target in range(n_channels):
-        own_train, own_val, own_cert = own_by_target[target]
-        for source in range(n_channels):
-            if source == target:
-                continue
-            source_train = _source_design(
-                loaded.values, target, source, loaded.splits.train_fit, cfg.lookback, cfg.pred_len
-            )
-            source_val = _source_design(
-                loaded.values, target, source, loaded.splits.val_alpha, cfg.lookback, cfg.pred_len
-            )
-            source_cert = _source_design(
-                loaded.values, target, source, loaded.splits.cert, cfg.lookback, cfg.pred_len
-            )
-            result = probe_pairwise(
-                target=target,
-                source=source,
-                y_train=own_train.y,
-                y_val=own_val.y,
-                y_cert=own_cert.y,
-                own_train=own_train.X,
-                own_val=own_val.X,
-                own_cert=own_cert.X,
-                source_train=source_train.X,
-                source_val=source_val.X,
-                source_cert=source_cert.X,
-                surrogate_bank=_surrogate_bank(
-                    loaded.values,
-                    target=target,
-                    source=source,
-                    splits=loaded.splits,
-                    lookback=cfg.lookback,
-                    horizon=cfg.pred_len,
-                    B=cfg.B,
-                    seed=cfg.seed,
-                    dataset=cfg.dataset,
-                ),
-                config=probe_cfg,
-            )
-            rows.append(_row(result))
-            print(
-                f"target={target} source={source} delta={result.delta_true:.6g} "
-                f"aligned={result.aligned_gain:.6g} p={result.p_value:.6g} "
-                f"candidate={result.certified_candidate}"
-            )
 
     df = pd.DataFrame(rows)
     run_dir = ensure_run_dir(Path("runs") / "phase4_reference", make_run_id(cfg))
@@ -191,6 +221,10 @@ def main() -> None:
     print(f"  unstable_metric={int(df['unstable_metric'].sum())}")
     print(f"  positive_delta={int(df['gate_delta_true'].sum())}")
     print(f"  positive_aligned_gain={int(df['gate_aligned_gain'].sum())}")
+    print(f"  n_jobs_requested={int(args.n_jobs)}")
+    print(f"  n_jobs_effective={int(n_jobs)}")
+    print(f"  cpu_count={int(os.cpu_count() or 1)}")
+    print(f"  blas_threads_policy={BLAS_THREADS_POLICY}")
     print(f"  output={out_path}")
 
 

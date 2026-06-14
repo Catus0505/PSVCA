@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -72,6 +73,14 @@ class CandidateGroupProbeResult:
     n_train_fit: int
     n_val_alpha: int
     n_cert: int
+
+
+def normalize_n_jobs(n_jobs: int) -> int:
+    if int(n_jobs) == -1:
+        return int(os.cpu_count() or 1)
+    if int(n_jobs) < 1:
+        raise ValueError("n_jobs must be >=1, or -1 for all available CPUs")
+    return int(n_jobs)
 
 
 def _as_1d(x, name: str) -> np.ndarray:
@@ -368,8 +377,10 @@ def probe_candidate_group(
     source_cert_by_source: dict[int, np.ndarray],
     surrogate_bank=None,
     group_id: str | None = None,
+    n_jobs: int = 1,
     config: PairwiseProbeConfig,
 ) -> CandidateGroupProbeResult:
+    normalize_n_jobs(n_jobs)
     if source == target:
         raise ValueError("target and source must differ for candidate-group probe")
     if source not in group_sources:
