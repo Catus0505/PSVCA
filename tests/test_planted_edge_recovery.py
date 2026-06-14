@@ -38,7 +38,7 @@ def test_bh_fdr_step_up_candidates_and_underpowered_flag() -> None:
     assert result.summary["n_fdr_pass"] == 1
 
 
-def test_stability_fraction_requires_block_candidate_and_fdr_when_present() -> None:
+def test_stability_fraction_uses_block_candidate_only() -> None:
     full = pd.DataFrame(
         [
             {"target": 0, "source": 1, "certified_candidate": True, "fdr_pass": True},
@@ -66,14 +66,16 @@ def test_stability_fraction_requires_block_candidate_and_fdr_when_present() -> N
         ),
     ]
 
+    # Per-block selection only checks certified_candidate; fdr_pass is intentionally ignored
+    # (M-B uses selection frequency, not within-subsample FDR reruns).
     result = apply_stability(full, blocks, StabilityConfig(min_fraction=2 / 3))
     out = result.edges.sort_values(["target", "source"]).reset_index(drop=True)
 
     assert out.loc[0, "stability_fraction"] == 2 / 3
     assert out.loc[0, "stability_pass"]
-    assert out.loc[1, "stability_fraction"] == 1 / 3
-    assert not out.loc[1, "stability_pass"]
-    assert out.loc[2, "stability_fraction"] == 0.0
+    assert out.loc[1, "stability_fraction"] == 2 / 3
+    assert out.loc[1, "stability_pass"]
+    assert out.loc[2, "stability_fraction"] == 1 / 3
     assert not out.loc[2, "stability_pass"]
 
     empty = apply_stability(full, [], StabilityConfig(min_fraction=0.1))
