@@ -23,6 +23,7 @@ from psvca.nulls.phase_surrogate import make_phase_surrogate
 # Weather N=21 is allowed for exact all-pair reference. ECL N=321 and
 # Traffic N=862 exceed this cap and must use screen_certify (dead rule 2).
 MAX_EXACT_N = 32
+MIN_FORMAL_B = 200
 
 
 def _bounds(split) -> tuple[int, int]:
@@ -159,9 +160,11 @@ def run_reference_pipeline(
         raise SystemExit(
             f"exact reference 仅限小 N,大 N 走 screen_certify: N={n_channels}, max={MAX_EXACT_N}"
         )
+    requested_tier = tier or cfg.tier
+    effective_B = max(effective_cfg.B, MIN_FORMAL_B) if requested_tier == "formal" else effective_cfg.B
     probe_cfg = PairwiseProbeConfig(
         alphas=effective_cfg.alpha_grid,
-        B=effective_cfg.B,
+        B=effective_B,
         seed=effective_cfg.seed,
         null_method=effective_cfg.null_method,
         alpha_rule="val_grid",
@@ -206,6 +209,7 @@ def run_reference_pipeline(
         "tier": effective_cfg.tier,
         "n_edges": int(len(aggregate)),
         "n_e_certified": int(aggregate["e_certified"].sum()),
+        "effective_B": int(effective_B),
         "n_jobs_requested": int(n_jobs),
         "n_jobs_effective": int(n_jobs_eff),
         "cpu_count": int(os.cpu_count() or 1),
