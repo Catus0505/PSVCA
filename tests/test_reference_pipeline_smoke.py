@@ -84,6 +84,53 @@ def test_reference_pipeline_allows_weather_sized_exact_reference(monkeypatch, tm
     assert len(edges) == 21 * 20
 
 
+@pytest.mark.parametrize(
+    ("tier", "n_channels", "cfg_b", "expected_b"),
+    [
+        ("formal", 7, 200, 300),
+        ("formal", 21, 200, 1000),
+        ("sanity", 21, 39, 39),
+    ],
+)
+def test_reference_pipeline_effective_b_is_n_adaptive_for_formal_only(
+    monkeypatch, tmp_path, tier, n_channels, cfg_b, expected_b
+) -> None:
+    cfg = PSVCAConfig(
+        data_root="synthetic://phase6",
+        dataset="synthetic_planted",
+        pred_len=1,
+        lookback=6,
+        seed=2026,
+        tier=tier,
+        split_ratios=(0.5, 0.25, 0.25),
+        stability_blocks=1,
+        alpha_grid=(0.01, 0.1),
+        null_method="phase",
+        B=cfg_b,
+    )
+
+    def fake_load_series(_cfg):
+        return SimpleNamespace(
+            values=pd.DataFrame(0.0, index=range(80), columns=range(n_channels)).to_numpy(),
+            channels=tuple(f"x{i}" for i in range(n_channels)),
+            splits=full_splits(),
+        )
+
+    monkeypatch.setattr(reference_pipeline, "load_series", fake_load_series)
+    monkeypatch.setattr(reference_pipeline, "_edge_task", lambda task: _dummy_row(task))
+    _, summary, _ = reference_pipeline.run_reference_pipeline(
+        cfg,
+        n_jobs=1,
+        output_root=tmp_path,
+    )
+
+    assert summary["effective_B"] == expected_b
+    assert summary["N"] == n_channels
+    assert summary["m"] == n_channels - 1
+    assert summary["q"] == 0.1
+    assert summary["C"] == 5
+
+
 def test_reference_pipeline_blocks_large_exact_reference(monkeypatch, tmp_path) -> None:
     cfg = PSVCAConfig(
         data_root="synthetic://phase6",
@@ -125,7 +172,7 @@ def _dummy_row(task: dict) -> dict:
         "delta_null_std": 0.0,
         "aligned_gain": -1.0,
         "p_value": 1.0,
-        "B": 1,
+        "B": int(task["cfg"].B),
         "certified_candidate": False,
         "schema_version": "psvca-edge-v0",
         "run_id": task["run_id"],

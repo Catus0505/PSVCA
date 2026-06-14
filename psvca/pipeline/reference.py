@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
@@ -24,6 +25,8 @@ from psvca.nulls.phase_surrogate import make_phase_surrogate
 # Traffic N=862 exceed this cap and must use screen_certify (dead rule 2).
 MAX_EXACT_N = 32
 MIN_FORMAL_B = 200
+# min perm p = 1/(1+B);要 ≤ (q/m)/C → B≈C·m/q;C=5 给 5× 余量。
+B_HEADROOM_C = 5
 
 
 def _bounds(split) -> tuple[int, int]:
@@ -168,12 +171,6 @@ def run_reference_pipeline(
     output_root: str | Path = "runs/phase7_reference",
 ) -> tuple[pd.DataFrame, dict, Path]:
     effective_cfg = replace(cfg, tier=tier or cfg.tier)
-    effective_B = (
-        max(effective_cfg.B, MIN_FORMAL_B)
-        if effective_cfg.tier == "formal"
-        else effective_cfg.B
-    )
-    effective_cfg = replace(effective_cfg, B=effective_B)
     n_jobs_eff = normalize_n_jobs(n_jobs)
     loaded = load_series(effective_cfg)
     n_channels = loaded.values.shape[1]
@@ -181,6 +178,14 @@ def run_reference_pipeline(
         raise SystemExit(
             f"exact reference 仅限小 N,大 N 走 screen_certify: N={n_channels}, max={MAX_EXACT_N}"
         )
+    fdr_q = FDRConfig().q
+    per_target_m = n_channels - 1
+    if effective_cfg.tier == "formal":
+        b_need = math.ceil(B_HEADROOM_C * per_target_m / fdr_q)
+        effective_B = max(effective_cfg.B, MIN_FORMAL_B, b_need)
+    else:
+        effective_B = effective_cfg.B
+    effective_cfg = replace(effective_cfg, B=effective_B)
     probe_cfg = PairwiseProbeConfig(
         alphas=effective_cfg.alpha_grid,
         B=effective_cfg.B,
@@ -225,6 +230,10 @@ def run_reference_pipeline(
         "n_edges": int(len(aggregate)),
         "n_e_certified": int(aggregate["e_certified"].sum()),
         "effective_B": int(effective_cfg.B),
+        "N": int(n_channels),
+        "m": int(per_target_m),
+        "q": float(fdr_q),
+        "C": int(B_HEADROOM_C),
         "n_jobs_requested": int(n_jobs),
         "n_jobs_effective": int(n_jobs_eff),
         "cpu_count": int(os.cpu_count() or 1),
