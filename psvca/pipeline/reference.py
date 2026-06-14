@@ -153,6 +153,12 @@ def run_reference_pipeline(
     output_root: str | Path = "runs/phase7_reference",
 ) -> tuple[pd.DataFrame, dict, Path]:
     effective_cfg = replace(cfg, tier=tier or cfg.tier)
+    effective_B = (
+        max(effective_cfg.B, MIN_FORMAL_B)
+        if effective_cfg.tier == "formal"
+        else effective_cfg.B
+    )
+    effective_cfg = replace(effective_cfg, B=effective_B)
     n_jobs_eff = normalize_n_jobs(n_jobs)
     loaded = load_series(effective_cfg)
     n_channels = loaded.values.shape[1]
@@ -160,11 +166,9 @@ def run_reference_pipeline(
         raise SystemExit(
             f"exact reference 仅限小 N,大 N 走 screen_certify: N={n_channels}, max={MAX_EXACT_N}"
         )
-    requested_tier = tier or cfg.tier
-    effective_B = max(effective_cfg.B, MIN_FORMAL_B) if requested_tier == "formal" else effective_cfg.B
     probe_cfg = PairwiseProbeConfig(
         alphas=effective_cfg.alpha_grid,
-        B=effective_B,
+        B=effective_cfg.B,
         seed=effective_cfg.seed,
         null_method=effective_cfg.null_method,
         alpha_rule="val_grid",
@@ -209,7 +213,7 @@ def run_reference_pipeline(
         "tier": effective_cfg.tier,
         "n_edges": int(len(aggregate)),
         "n_e_certified": int(aggregate["e_certified"].sum()),
-        "effective_B": int(effective_B),
+        "effective_B": int(effective_cfg.B),
         "n_jobs_requested": int(n_jobs),
         "n_jobs_effective": int(n_jobs_eff),
         "cpu_count": int(os.cpu_count() or 1),

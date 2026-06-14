@@ -35,7 +35,7 @@ def test_reference_pipeline_synthetic_planted_smoke(monkeypatch, tmp_path) -> No
     monkeypatch.setattr(reference_pipeline, "load_series", fake_load_series)
     edges, summary, run_dir = reference_pipeline.run_reference_pipeline(
         cfg,
-        tier="sanity",
+        tier="formal",
         n_jobs=1,
         output_root=tmp_path,
     )
