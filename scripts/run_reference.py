@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import os
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import asdict
 from pathlib import Path
 import sys
 
@@ -20,12 +19,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from psvca.certify.probe import PairwiseProbeConfig, normalize_n_jobs, probe_pairwise
+from psvca.certify.probe import PairwiseProbeConfig, normalize_n_jobs
 from psvca.config import load_config
 from psvca.data.loader import load_series
 from psvca.io.artifacts import ensure_run_dir, make_run_id
-from psvca.linalg.design import make_lagged_design
-from psvca.nulls.phase_surrogate import make_phase_surrogate
+from psvca.pipeline.reference import pairwise_edge_task, run_reference_pipeline
 
 
 BLAS_THREADS_POLICY = {
@@ -37,120 +35,8 @@ BLAS_THREADS_POLICY = {
 }
 
 
-def _bounds(split) -> tuple[int, int]:
-    return int(split.start), int(split.end)
-
-
-def _own_design(values: np.ndarray, target: int, split, lookback: int, horizon: int):
-    start, end = _bounds(split)
-    return make_lagged_design(
-        values,
-        target=target,
-        sources=(),
-        lookback=lookback,
-        horizon=horizon,
-        y_start=start,
-        y_end=end,
-        include_own=True,
-    )
-
-
-def _source_design(values: np.ndarray, target: int, source: int, split, lookback: int, horizon: int):
-    start, end = _bounds(split)
-    return make_lagged_design(
-        values,
-        target=target,
-        sources=(source,),
-        lookback=lookback,
-        horizon=horizon,
-        y_start=start,
-        y_end=end,
-        include_own=False,
-    )
-
-
-def _surrogate_bank(
-    values: np.ndarray,
-    *,
-    target: int,
-    source: int,
-    splits,
-    lookback: int,
-    horizon: int,
-    B: int,
-    seed: int,
-    dataset: str,
-) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    bank = []
-    for surrogate_id in range(B):
-        surrogate = make_phase_surrogate(
-            values[:, source],
-            source_idx=source,
-            surrogate_id=surrogate_id,
-            seed=seed,
-            dataset=dataset,
-            split="pre_test",
-            cache_dir=None,
-        ).values
-        s_values = values.copy()
-        s_values[:, source] = surrogate
-        bank.append(
-            (
-                _source_design(s_values, target, source, splits.train_fit, lookback, horizon).X,
-                _source_design(s_values, target, source, splits.val_alpha, lookback, horizon).X,
-                _source_design(s_values, target, source, splits.cert, lookback, horizon).X,
-            )
-        )
-    return bank
-
-
-def _row(result) -> dict:
-    data = asdict(result)
-    data.pop("delta_null")
-    data.pop("alpha_null")
-    data["mode"] = "pairwise"
-    data["alpha_rule"] = "val_grid"
-    return data
-
-
 def _run_pairwise_edge_task(task: dict) -> dict:
-    values = task["values"]
-    cfg = task["cfg"]
-    splits = task["splits"]
-    target = int(task["target"])
-    source = int(task["source"])
-    own_train = _own_design(values, target, splits.train_fit, cfg.lookback, cfg.pred_len)
-    own_val = _own_design(values, target, splits.val_alpha, cfg.lookback, cfg.pred_len)
-    own_cert = _own_design(values, target, splits.cert, cfg.lookback, cfg.pred_len)
-    source_train = _source_design(values, target, source, splits.train_fit, cfg.lookback, cfg.pred_len)
-    source_val = _source_design(values, target, source, splits.val_alpha, cfg.lookback, cfg.pred_len)
-    source_cert = _source_design(values, target, source, splits.cert, cfg.lookback, cfg.pred_len)
-    result = probe_pairwise(
-        target=target,
-        source=source,
-        y_train=own_train.y,
-        y_val=own_val.y,
-        y_cert=own_cert.y,
-        own_train=own_train.X,
-        own_val=own_val.X,
-        own_cert=own_cert.X,
-        source_train=source_train.X,
-        source_val=source_val.X,
-        source_cert=source_cert.X,
-        surrogate_bank=_surrogate_bank(
-            values,
-            target=target,
-            source=source,
-            splits=splits,
-            lookback=cfg.lookback,
-            horizon=cfg.pred_len,
-            B=cfg.B,
-            seed=cfg.seed,
-            dataset=cfg.dataset,
-        ),
-        config=task["probe_cfg"],
-    )
-    return _row(result)
+    return pairwise_edge_task(task)
 
 
 def main() -> None:
@@ -160,9 +46,14 @@ def main() -> None:
     parser.add_argument("--n-jobs", type=int, default=1)
     args = parser.parse_args()
 
-    if args.tier != "sanity":
-        raise SystemExit("Phase 4 reference only supports --tier sanity")
     cfg = load_config(args.config)
+    if args.tier != "sanity":
+        edges, summary, _ = run_reference_pipeline(cfg, tier=args.tier, n_jobs=args.n_jobs)
+        print("summary:")
+        for key, value in summary.items():
+            print(f"  {key}={value}")
+        print(f"  n_e_certified={int(edges['e_certified'].sum())}")
+        return
     loaded = load_series(cfg)
     n_jobs = normalize_n_jobs(args.n_jobs)
     n_channels = loaded.values.shape[1]
