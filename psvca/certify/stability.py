@@ -7,7 +7,7 @@ import pandas as pd
 
 @dataclass(frozen=True)
 class StabilityConfig:
-    min_fraction: float = 0.67
+    min_fraction: float = 0.60
     key_cols: tuple[str, ...] = ("target", "source")
 
 
@@ -42,8 +42,6 @@ def apply_stability(
         for block_index, block in enumerate(block_edges):
             _require_columns(block, required, f"block_edges[{block_index}]")
             mask = block["certified_candidate"].fillna(False).astype(bool)
-            if "fdr_pass" in block.columns:
-                mask &= block["fdr_pass"].fillna(False).astype(bool)
             passed = block.loc[mask, list(config.key_cols)].drop_duplicates()
             for _, row in passed.iterrows():
                 key = tuple(row[col] for col in config.key_cols)
