@@ -1,0 +1,11 @@
+data_root: synthetic://phase6
+dataset: synthetic_planted
+pred_len: 1
+lookback: 6
+seed: 2026
+tier: sanity
+split_ratios: [0.5, 0.25, 0.25]
+stability_blocks: 3
+alpha_grid: [0.01, 0.1, 1.0, 10.0]
+null_method: phase
+B: 39
