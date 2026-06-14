@@ -134,6 +134,13 @@ def _edge_task(task: dict) -> dict:
     return pairwise_edge_task(task)
 
 
+def _run_edge_tasks(tasks, n_jobs_eff):
+    if n_jobs_eff <= 1 or len(tasks) <= 1:
+        return [_edge_task(task) for task in tasks]
+    with ProcessPoolExecutor(max_workers=min(n_jobs_eff, len(tasks))) as executor:
+        return list(executor.map(_edge_task, tasks))
+
+
 def _cert_blocks(splits, k: int):
     start, end = int(splits.cert.start), int(splits.cert.end)
     edges = [start + (end - start) * i // k for i in range(k + 1)]
@@ -190,17 +197,13 @@ def run_reference_pipeline(
         for source in range(n_channels)
         if source != target
     ]
-    if n_jobs_eff == 1 or len(tasks) <= 1:
-        rows = [_edge_task(task) for task in tasks]
-    else:
-        with ProcessPoolExecutor(max_workers=min(n_jobs_eff, len(tasks))) as executor:
-            rows = list(executor.map(_edge_task, tasks))
+    rows = _run_edge_tasks(tasks, n_jobs_eff)
     full_edges = pd.DataFrame(rows).sort_values(["target", "source"]).reset_index(drop=True)
     fdr_edges = apply_bh_fdr(full_edges, FDRConfig(q=0.1, min_B_for_formal=200)).edges
     block_edges = []
     for block_splits in _cert_blocks(loaded.splits, max(1, effective_cfg.stability_blocks)):
         block_tasks = [{**task, "splits": block_splits} for task in tasks]
-        block_rows = [_edge_task(task) for task in block_tasks]
+        block_rows = _run_edge_tasks(block_tasks, n_jobs_eff)
         block_edges.append(apply_bh_fdr(pd.DataFrame(block_rows), FDRConfig(q=0.1, min_B_for_formal=200)).edges)
     stable = apply_stability(fdr_edges, block_edges, StabilityConfig()).edges
     aggregate = aggregate_certified_edges(stable).edges
