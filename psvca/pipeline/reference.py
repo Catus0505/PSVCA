@@ -152,6 +152,14 @@ def _cert_blocks(splits, k: int):
     return blocks
 
 
+def _apply_bh_fdr_per_target(edges_df, fdr_config):
+    parts = []
+    for _, g in edges_df.groupby("target", sort=False):
+        parts.append(apply_bh_fdr(g, fdr_config).edges)
+    out = pd.concat(parts, ignore_index=True)
+    return out.sort_values(["target", "source"]).reset_index(drop=True)
+
+
 def run_reference_pipeline(
     cfg: PSVCAConfig,
     *,
@@ -199,12 +207,12 @@ def run_reference_pipeline(
     ]
     rows = _run_edge_tasks(tasks, n_jobs_eff)
     full_edges = pd.DataFrame(rows).sort_values(["target", "source"]).reset_index(drop=True)
-    fdr_edges = apply_bh_fdr(full_edges, FDRConfig(q=0.1, min_B_for_formal=200)).edges
+    fdr_edges = _apply_bh_fdr_per_target(full_edges, FDRConfig(q=0.1, min_B_for_formal=200))
     block_edges = []
     for block_splits in _cert_blocks(loaded.splits, max(1, effective_cfg.stability_blocks)):
         block_tasks = [{**task, "splits": block_splits} for task in tasks]
         block_rows = _run_edge_tasks(block_tasks, n_jobs_eff)
-        block_edges.append(apply_bh_fdr(pd.DataFrame(block_rows), FDRConfig(q=0.1, min_B_for_formal=200)).edges)
+        block_edges.append(_apply_bh_fdr_per_target(pd.DataFrame(block_rows), FDRConfig(q=0.1, min_B_for_formal=200)))
     stable = apply_stability(fdr_edges, block_edges, StabilityConfig()).edges
     aggregate = aggregate_certified_edges(stable).edges
     run_dir = ensure_run_dir(output_root, run_id)
