@@ -1,0 +1,11 @@
+data_root: /home1/lzh/dataset
+dataset: ETTh1
+pred_len: 720
+lookback: 96
+seed: 0
+tier: sanity
+split_ratios: [0.6, 0.2, 0.2]
+stability_blocks: 5
+alpha_grid: [0.001, 0.01, 0.1, 1.0, 10.0]
+null_method: phase
+B: 20
