@@ -44,7 +44,6 @@ def _source_design(values: np.ndarray, target: int, source: int, split, lookback
 
 
 def _surrogate_bank(values, *, target, source, splits, lookback, horizon, B, seed, dataset):
-    bank = []
     for surrogate_id in range(B):
         surrogate = make_phase_surrogate(
             values[:, source],
@@ -57,14 +56,11 @@ def _surrogate_bank(values, *, target, source, splits, lookback, horizon, B, see
         ).values
         s_values = values.copy()
         s_values[:, source] = surrogate
-        bank.append(
-            (
-                _source_design(s_values, target, source, splits.train_fit, lookback, horizon).X,
-                _source_design(s_values, target, source, splits.val_alpha, lookback, horizon).X,
-                _source_design(s_values, target, source, splits.cert, lookback, horizon).X,
-            )
+        yield (
+            _source_design(s_values, target, source, splits.train_fit, lookback, horizon).X,
+            _source_design(s_values, target, source, splits.val_alpha, lookback, horizon).X,
+            _source_design(s_values, target, source, splits.cert, lookback, horizon).X,
         )
-    return bank
 
 
 def _row(result, *, cfg: PSVCAConfig | None = None, run_id: str | None = None, git_hash: str | None = None) -> dict:

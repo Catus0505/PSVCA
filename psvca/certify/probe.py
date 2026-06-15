@@ -268,16 +268,18 @@ def probe_pairwise(
 
     delta_null = []
     alpha_null = []
-    bank = list(surrogate_bank) if surrogate_bank is not None else None
-    if bank is not None and len(bank) != config.B:
-        raise ValueError("surrogate_bank length must equal B")
-    if bank is None and config.null_method == "phase":
+    bank_iter = iter(surrogate_bank) if surrogate_bank is not None else None
+    if bank_iter is None and config.null_method == "phase":
         raise ValueError(
             "phase null for lagged designs requires source-level surrogate_bank"
         )
     for b in range(config.B):
-        if bank is not None:
-            s_train, s_val, s_cert = _surrogate_blocks(bank[b])
+        if bank_iter is not None:
+            try:
+                entry = next(bank_iter)
+            except StopIteration as exc:
+                raise ValueError("surrogate_bank yielded fewer than B") from exc
+            s_train, s_val, s_cert = _surrogate_blocks(entry)
             s_train = _as_2d(s_train, f"surrogate_train_{b}")
             s_val = _as_2d(s_val, f"surrogate_val_{b}")
             s_cert = _as_2d(s_cert, f"surrogate_cert_{b}")
@@ -312,6 +314,13 @@ def probe_pairwise(
         )
         delta_null.append(delta_b)
         alpha_null.append(alpha_b)
+    if bank_iter is not None:
+        try:
+            next(bank_iter)
+        except StopIteration:
+            pass
+        else:
+            raise ValueError("surrogate_bank yielded more than B")
 
     delta_null_arr = np.asarray(delta_null, dtype=np.float64)
     alpha_null_arr = np.asarray(alpha_null, dtype=np.float64)
@@ -466,16 +475,18 @@ def probe_candidate_group(
 
     delta_null = []
     alpha_null = []
-    bank = list(surrogate_bank) if surrogate_bank is not None else None
-    if bank is not None and len(bank) != config.B:
-        raise ValueError("surrogate_bank length must equal B")
-    if bank is None and config.null_method == "phase":
+    bank_iter = iter(surrogate_bank) if surrogate_bank is not None else None
+    if bank_iter is None and config.null_method == "phase":
         raise ValueError(
             "phase null for lagged designs requires source-level surrogate_bank"
         )
     for b in range(config.B):
-        if bank is not None:
-            s_train, s_val, s_cert = _surrogate_blocks(bank[b])
+        if bank_iter is not None:
+            try:
+                entry = next(bank_iter)
+            except StopIteration as exc:
+                raise ValueError("surrogate_bank yielded fewer than B") from exc
+            s_train, s_val, s_cert = _surrogate_blocks(entry)
             s_train = _as_2d(s_train, f"surrogate_train_{b}")
             s_val = _as_2d(s_val, f"surrogate_val_{b}")
             s_cert = _as_2d(s_cert, f"surrogate_cert_{b}")
@@ -519,6 +530,13 @@ def probe_candidate_group(
         )
         delta_null.append(delta_b)
         alpha_null.append(alpha_b)
+    if bank_iter is not None:
+        try:
+            next(bank_iter)
+        except StopIteration:
+            pass
+        else:
+            raise ValueError("surrogate_bank yielded more than B")
 
     delta_null_arr = np.asarray(delta_null, dtype=np.float64)
     alpha_null_arr = np.asarray(alpha_null, dtype=np.float64)
