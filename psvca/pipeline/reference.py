@@ -140,8 +140,17 @@ def _edge_task(task: dict) -> dict:
 def _run_edge_tasks(tasks, n_jobs_eff):
     if n_jobs_eff <= 1 or len(tasks) <= 1:
         return [_edge_task(task) for task in tasks]
-    with ProcessPoolExecutor(max_workers=min(n_jobs_eff, len(tasks))) as executor:
-        return list(executor.map(_edge_task, tasks))
+    max_workers = min(n_jobs_eff, len(tasks))
+    import sys
+
+    if sys.version_info >= (3, 11):
+        with ProcessPoolExecutor(max_workers=max_workers, max_tasks_per_child=2) as executor:
+            return list(executor.map(_edge_task, tasks))
+
+    import multiprocessing as mp
+
+    with mp.Pool(processes=max_workers, maxtasksperchild=2) as pool:
+        return list(pool.map(_edge_task, tasks))
 
 
 def _cert_blocks(splits, k: int):
