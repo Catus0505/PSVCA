@@ -24,6 +24,7 @@ from psvca.io.artifacts import ensure_run_dir, get_git_hash, make_run_id
 from psvca.io.schema import SCHEMA_VERSION
 from psvca.linalg.design import make_lagged_design
 from psvca.nulls.phase_surrogate import make_phase_surrogate
+from psvca.pipeline.driver import CertificationDriver
 
 
 # Weather N=21 is allowed for exact all-pair reference. ECL N=321 and
@@ -245,6 +246,24 @@ def _apply_bh_fdr_per_target(edges_df, fdr_config):
     return out.sort_values(["target", "source"]).reset_index(drop=True)
 
 
+def _metadata_for(cfg: PSVCAConfig, run_id: str, git_hash: str):
+    base = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": run_id,
+        "config_hash": config_hash(cfg),
+        "git_hash": git_hash,
+        "seed": int(cfg.seed),
+        "dataset": cfg.dataset,
+        "pred_len": int(cfg.pred_len),
+        "tier": cfg.tier,
+    }
+
+    def build(_target: int, _source: int) -> dict:
+        return dict(base)
+
+    return build
+
+
 def run_reference_pipeline(
     cfg: PSVCAConfig,
     *,
@@ -277,72 +296,64 @@ def run_reference_pipeline(
     )
     run_id = make_run_id(effective_cfg)
     git_hash = get_git_hash()
-    targets = range(n_channels)
     precompute_own = _edge_task is _DEFAULT_EDGE_TASK
-    own_designs = (
-        _own_designs_by_target(loaded.values, loaded.splits, effective_cfg, targets)
-        if precompute_own
-        else {}
-    )
-    own_caches = _own_caches_by_target(own_designs, probe_cfg) if precompute_own else {}
-    source_surrogates = _phase_surrogates_by_source(
-        loaded.values,
-        sources=range(n_channels),
-        B=effective_cfg.B,
-        seed=effective_cfg.seed,
-        dataset=effective_cfg.dataset,
-    )
-    tasks = [
-        ({
-            "values": loaded.values,
-            "splits": loaded.splits,
-            "cfg": effective_cfg,
-            "probe_cfg": probe_cfg,
-            "target": target,
-            "source": source,
-            "source_surrogates": source_surrogates,
-            "run_id": run_id,
-            "git_hash": git_hash,
-        }
-        | (
+    targets = range(n_channels)
+    if precompute_own:
+        driver = CertificationDriver(
+            values=loaded.values,
+            splits=loaded.splits,
+            lookback=effective_cfg.lookback,
+            horizon=effective_cfg.pred_len,
+            probe_config=probe_cfg,
+            seed=effective_cfg.seed,
+            dataset=effective_cfg.dataset,
+            n_jobs=n_jobs_eff,
+        )
+        full_edges = driver.pairwise_edges(
+            targets,
+            metadata_for=_metadata_for(effective_cfg, run_id, git_hash),
+        )
+    else:
+        tasks = [
             {
-                "own_designs": own_designs[target],
-                "own_cache": own_caches[target],
+                "values": loaded.values,
+                "splits": loaded.splits,
+                "cfg": effective_cfg,
+                "probe_cfg": probe_cfg,
+                "target": target,
+                "source": source,
+                "run_id": run_id,
+                "git_hash": git_hash,
             }
-            if precompute_own
-            else {}
-        ))
-        for target in targets
-        for source in range(n_channels)
-        if source != target
-    ]
-    rows = _run_edge_tasks(tasks, n_jobs_eff)
-    full_edges = pd.DataFrame(rows).sort_values(["target", "source"]).reset_index(drop=True)
+            for target in targets
+            for source in range(n_channels)
+            if source != target
+        ]
+        rows = _run_edge_tasks(tasks, n_jobs_eff)
+        full_edges = pd.DataFrame(rows).sort_values(["target", "source"]).reset_index(drop=True)
     fdr_edges = _apply_bh_fdr_per_target(full_edges, FDRConfig(q=0.1, min_B_for_formal=200))
     block_edges = []
     for block_splits in _cert_blocks(loaded.splits, max(1, effective_cfg.stability_blocks)):
-        block_own_designs = (
-            _own_designs_by_target(loaded.values, block_splits, effective_cfg, targets)
-            if precompute_own
-            else {}
-        )
-        block_own_caches = _own_caches_by_target(block_own_designs, probe_cfg) if precompute_own else {}
-        block_tasks = [
-            (
-                {**task, "splits": block_splits}
-                | (
-                    {
-                        "own_designs": block_own_designs[int(task["target"])],
-                        "own_cache": block_own_caches[int(task["target"])],
-                    }
-                    if precompute_own
-                    else {}
-                )
+        if precompute_own:
+            block_driver = CertificationDriver(
+                values=loaded.values,
+                splits=block_splits,
+                lookback=effective_cfg.lookback,
+                horizon=effective_cfg.pred_len,
+                probe_config=probe_cfg,
+                seed=effective_cfg.seed,
+                dataset=effective_cfg.dataset,
+                n_jobs=n_jobs_eff,
             )
-            for task in tasks
-        ]
-        block_rows = _run_edge_tasks(block_tasks, n_jobs_eff)
-        block_edges.append(_apply_bh_fdr_per_target(pd.DataFrame(block_rows), FDRConfig(q=0.1, min_B_for_formal=200)))
+            block_df = block_driver.pairwise_edges(
+                targets,
+                metadata_for=_metadata_for(effective_cfg, run_id, git_hash),
+            )
+        else:
+            block_tasks = [{**task, "splits": block_splits} for task in tasks]
+            block_rows = _run_edge_tasks(block_tasks, n_jobs_eff)
+            block_df = pd.DataFrame(block_rows)
+        block_edges.append(_apply_bh_fdr_per_target(block_df, FDRConfig(q=0.1, min_B_for_formal=200)))
     stable = apply_stability(fdr_edges, block_edges, StabilityConfig()).edges
     aggregate = aggregate_certified_edges(stable).edges
     run_dir = ensure_run_dir(output_root, run_id)

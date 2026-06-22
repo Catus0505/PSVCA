@@ -3,8 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from concurrent.futures import ProcessPoolExecutor
-from dataclasses import asdict
 from pathlib import Path
 import sys
 
@@ -21,18 +19,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from psvca.certify.probe import (
-    PairwiseProbeConfig,
-    fit_baseline_cache,
-    probe_candidate_group,
-    probe_pairwise,
-)
+from psvca.certify.probe import PairwiseProbeConfig
 from psvca.certify.probe import normalize_n_jobs
 from psvca.config import load_config
 from psvca.data.loader import load_series
 from psvca.io.artifacts import ensure_run_dir, make_run_id
-from psvca.linalg.design import make_lagged_design
-from psvca.nulls.phase_surrogate import make_phase_surrogate
+from psvca.pipeline.driver import CertificationDriver
 from psvca.screen.value_screen import ValueScreenConfig, run_value_screen
 
 
@@ -43,203 +35,6 @@ BLAS_THREADS_POLICY = {
     "VECLIB_MAXIMUM_THREADS": os.environ.get("VECLIB_MAXIMUM_THREADS"),
     "NUMEXPR_NUM_THREADS": os.environ.get("NUMEXPR_NUM_THREADS"),
 }
-
-
-def _bounds(split) -> tuple[int, int]:
-    return int(split.start), int(split.end)
-
-
-def _own_design(values: np.ndarray, target: int, split, lookback: int, horizon: int):
-    start, end = _bounds(split)
-    return make_lagged_design(
-        values,
-        target=target,
-        sources=(),
-        lookback=lookback,
-        horizon=horizon,
-        y_start=start,
-        y_end=end,
-        include_own=True,
-    )
-
-
-def _source_design(values: np.ndarray, target: int, source: int, split, lookback: int, horizon: int):
-    start, end = _bounds(split)
-    return make_lagged_design(
-        values,
-        target=target,
-        sources=(source,),
-        lookback=lookback,
-        horizon=horizon,
-        y_start=start,
-        y_end=end,
-        include_own=False,
-    )
-
-
-def _surrogate_bank(
-    values: np.ndarray,
-    *,
-    target: int,
-    source: int,
-    splits,
-    lookback: int,
-    horizon: int,
-    B: int,
-    seed: int,
-    dataset: str,
-    source_surrogates: dict[int, list[np.ndarray]] | None = None,
-) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    bank = []
-    for surrogate_id in range(B):
-        if source_surrogates is None:
-            surrogate = make_phase_surrogate(
-                values[:, source],
-                source_idx=source,
-                surrogate_id=surrogate_id,
-                seed=seed,
-                dataset=dataset,
-                split="pre_test",
-                cache_dir=None,
-            ).values
-        else:
-            surrogate = source_surrogates[int(source)][surrogate_id]
-        s_values = values.copy()
-        s_values[:, source] = surrogate
-        bank.append(
-            (
-                _source_design(s_values, target, source, splits.train_fit, lookback, horizon).X,
-                _source_design(s_values, target, source, splits.val_alpha, lookback, horizon).X,
-                _source_design(s_values, target, source, splits.cert, lookback, horizon).X,
-            )
-        )
-    return bank
-
-
-def _phase_surrogates_by_source(
-    values: np.ndarray,
-    *,
-    sources: tuple[int, ...],
-    B: int,
-    seed: int,
-    dataset: str,
-) -> dict[int, list[np.ndarray]]:
-    return {
-        int(source): [
-            make_phase_surrogate(
-                values[:, int(source)],
-                source_idx=int(source),
-                surrogate_id=surrogate_id,
-                seed=seed,
-                dataset=dataset,
-                split="pre_test",
-                cache_dir=None,
-            ).values
-            for surrogate_id in range(B)
-        ]
-        for source in sources
-    }
-
-
-def _pairwise_row(result) -> dict:
-    data = asdict(result)
-    data.pop("delta_null")
-    data.pop("alpha_null")
-    data["mode"] = "pairwise"
-    data["alpha_rule"] = "val_grid"
-    return data
-
-
-def _candidate_group_row(result, screen_row: pd.Series) -> dict:
-    data = asdict(result)
-    data.pop("delta_null")
-    data.pop("alpha_null")
-    data["s_screen"] = float(screen_row["s_screen"])
-    data["screen_rank"] = int(screen_row["screen_rank"])
-    return data
-
-
-def _candidate_group_row_from_values(
-    result,
-    *,
-    s_screen: float,
-    screen_rank: int,
-) -> dict:
-    data = asdict(result)
-    data.pop("delta_null")
-    data.pop("alpha_null")
-    data["s_screen"] = float(s_screen)
-    data["screen_rank"] = int(screen_rank)
-    return data
-
-
-def _run_candidate_edge_task(task: dict) -> tuple[dict, dict]:
-    target = int(task["target"])
-    source = int(task["source"])
-    cfg = task["cfg"]
-    probe_cfg = task["probe_cfg"]
-    splits = task["splits"]
-    values = task["values"]
-    own_train, own_val, own_cert = task["own_designs"]
-    own_cache = task["own_cache"]
-    source_train_by_source = task["source_train_by_source"]
-    source_val_by_source = task["source_val_by_source"]
-    source_cert_by_source = task["source_cert_by_source"]
-    source_surrogates = task["source_surrogates"]
-    bank = _surrogate_bank(
-        values,
-        target=target,
-        source=source,
-        splits=splits,
-        lookback=cfg.lookback,
-        horizon=cfg.pred_len,
-        B=probe_cfg.B,
-        seed=cfg.seed,
-        dataset=cfg.dataset,
-        source_surrogates=source_surrogates,
-    )
-    pairwise = probe_pairwise(
-        target=target,
-        source=source,
-        y_train=own_train.y,
-        y_val=own_val.y,
-        y_cert=own_cert.y,
-        own_train=own_train.X,
-        own_val=own_val.X,
-        own_cert=own_cert.X,
-        source_train=source_train_by_source[source],
-        source_val=source_val_by_source[source],
-        source_cert=source_cert_by_source[source],
-        own_cache=own_cache,
-        surrogate_bank=bank,
-        config=probe_cfg,
-    )
-    candidate = probe_candidate_group(
-        target=target,
-        source=source,
-        group_sources=task["group_sources"],
-        y_train=own_train.y,
-        y_val=own_val.y,
-        y_cert=own_cert.y,
-        own_train=own_train.X,
-        own_val=own_val.X,
-        own_cert=own_cert.X,
-        source_train_by_source=source_train_by_source,
-        source_val_by_source=source_val_by_source,
-        source_cert_by_source=source_cert_by_source,
-        surrogate_bank=bank,
-        group_id=task["group_id"],
-        n_jobs=task["n_jobs"],
-        config=probe_cfg,
-    )
-    return (
-        _pairwise_row(pairwise),
-        _candidate_group_row_from_values(
-            candidate,
-            s_screen=float(task["s_screen"]),
-            screen_rank=int(task["screen_rank"]),
-        ),
-    )
 
 
 def _spearman(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
@@ -301,93 +96,47 @@ def main() -> None:
         skip_null_on_fail=True,
         delta_floor=0.0,
     )
-    own_by_target = {
-        target: (
-            _own_design(loaded.values, target, loaded.splits.train_fit, cfg.lookback, cfg.pred_len),
-            _own_design(loaded.values, target, loaded.splits.val_alpha, cfg.lookback, cfg.pred_len),
-            _own_design(loaded.values, target, loaded.splits.cert, cfg.lookback, cfg.pred_len),
-        )
-        for target in targets
-    }
-    own_cache_by_target = {
-        target: fit_baseline_cache(
-            sources=(),
-            X_train=own_train.X,
-            y_train=own_train.y,
-            X_val=own_val.X,
-            y_val=own_val.y,
-            X_cert=own_cert.X,
-            y_cert=own_cert.y,
-            alphas=probe_cfg.alphas,
-            alpha_rule=probe_cfg.alpha_rule,
-            variance_eps=probe_cfg.variance_eps,
-        )
-        for target, (own_train, own_val, own_cert) in own_by_target.items()
-    }
-
-    tasks = []
-    passed = screen.edges[screen.edges["passed_screen"]].copy()
-    screened_sources = tuple(sorted(int(s) for s in passed["source"].unique()))
-    source_surrogates = _phase_surrogates_by_source(
-        loaded.values,
-        sources=screened_sources,
-        B=probe_cfg.B,
+    driver = CertificationDriver(
+        values=loaded.values,
+        splits=loaded.splits,
+        lookback=cfg.lookback,
+        horizon=cfg.pred_len,
+        probe_config=probe_cfg,
         seed=cfg.seed,
         dataset=cfg.dataset,
+        n_jobs=n_jobs,
     )
+
+    passed = screen.edges[screen.edges["passed_screen"]].copy()
+    screen_meta = {
+        (int(row.target), int(row.source)): {
+            "s_screen": float(row.s_screen),
+            "screen_rank": int(row.screen_rank),
+            "passed_screen": bool(row.passed_screen),
+        }
+        for row in passed.itertuples(index=False)
+    }
+    target_groups: dict[int, tuple[int, ...]] = {}
     for target in targets:
         target_screen = passed[passed["target"] == target].sort_values("screen_rank")
         group_sources = tuple(int(s) for s in target_screen["source"].tolist())
-        if not group_sources:
-            continue
+        if group_sources:
+            target_groups[int(target)] = group_sources
 
-        source_train_by_source = {}
-        source_val_by_source = {}
-        source_cert_by_source = {}
-        for source in group_sources:
-            source_train_by_source[source] = _source_design(
-                loaded.values, target, source, loaded.splits.train_fit, cfg.lookback, cfg.pred_len
-            ).X
-            source_val_by_source[source] = _source_design(
-                loaded.values, target, source, loaded.splits.val_alpha, cfg.lookback, cfg.pred_len
-            ).X
-            source_cert_by_source[source] = _source_design(
-                loaded.values, target, source, loaded.splits.cert, cfg.lookback, cfg.pred_len
-            ).X
-
-        for _, screen_row in target_screen.iterrows():
-            tasks.append(
-                {
-                    "target": int(target),
-                    "source": int(screen_row["source"]),
-                    "s_screen": float(screen_row["s_screen"]),
-                    "screen_rank": int(screen_row["screen_rank"]),
-                    "group_sources": group_sources,
-                    "group_id": f"target_{target}_top{len(group_sources)}",
-                    "values": loaded.values,
-                    "splits": loaded.splits,
-                    "cfg": cfg,
-                    "probe_cfg": probe_cfg,
-                    "n_jobs": n_jobs,
-                    "own_designs": own_by_target[target],
-                    "own_cache": own_cache_by_target[target],
-                    "source_train_by_source": source_train_by_source,
-                    "source_val_by_source": source_val_by_source,
-                    "source_cert_by_source": source_cert_by_source,
-                    "source_surrogates": source_surrogates,
-                }
-            )
-
-    if n_jobs == 1 or len(tasks) <= 1:
-        edge_results = [_run_candidate_edge_task(task) for task in tasks]
-    else:
-        with ProcessPoolExecutor(max_workers=min(n_jobs, len(tasks))) as executor:
-            edge_results = list(executor.map(_run_candidate_edge_task, tasks))
-    pairwise_rows = [pairwise_row for pairwise_row, _ in edge_results]
-    candidate_rows = [candidate_row for _, candidate_row in edge_results]
-
+    candidate_df = driver.candidate_group_edges(
+        target_groups,
+        metadata_for=lambda target, source: screen_meta[(target, source)],
+    )
+    pairwise_rows = [
+        driver.probe_pairwise_row(
+            target=target,
+            source=source,
+            metadata=screen_meta[(target, source)],
+        )
+        for target, group_sources in target_groups.items()
+        for source in group_sources
+    ]
     pairwise_df = pd.DataFrame(pairwise_rows)
-    candidate_df = pd.DataFrame(candidate_rows)
     if not pairwise_df.empty:
         pairwise_df = pairwise_df.sort_values(["target", "source"]).reset_index(drop=True)
     if not candidate_df.empty:
