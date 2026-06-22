@@ -4,6 +4,7 @@ from dataclasses import asdict
 from pathlib import Path
 import sys
 
+import numpy as np
 import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -45,17 +46,48 @@ def _source_design(values, target: int, source: int, split, lookback: int, horiz
     )
 
 
-def _surrogate_bank(values, *, target: int, source: int, splits, lookback: int, horizon: int, B: int, seed: int):
+def _phase_surrogates_by_source(values, *, sources: tuple[int, ...], B: int, seed: int):
+    return {
+        int(source): [
+            make_phase_surrogate(
+                values[:, int(source)],
+                source_idx=int(source),
+                surrogate_id=surrogate_id,
+                seed=seed,
+                dataset="speedup_invariance",
+                split="pre_test",
+            ).values
+            for surrogate_id in range(B)
+        ]
+        for source in sources
+    }
+
+
+def _surrogate_bank(
+    values,
+    *,
+    target: int,
+    source: int,
+    splits,
+    lookback: int,
+    horizon: int,
+    B: int,
+    seed: int,
+    source_surrogates=None,
+):
     bank = []
     for surrogate_id in range(B):
-        surrogate = make_phase_surrogate(
-            values[:, source],
-            source_idx=source,
-            surrogate_id=surrogate_id,
-            seed=seed,
-            dataset="speedup_invariance",
-            split="pre_test",
-        ).values
+        if source_surrogates is None:
+            surrogate = make_phase_surrogate(
+                values[:, source],
+                source_idx=source,
+                surrogate_id=surrogate_id,
+                seed=seed,
+                dataset="speedup_invariance",
+                split="pre_test",
+            ).values
+        else:
+            surrogate = source_surrogates[int(source)][surrogate_id]
         s_values = values.copy()
         s_values[:, source] = surrogate
         bank.append(
@@ -68,10 +100,15 @@ def _surrogate_bank(values, *, target: int, source: int, splits, lookback: int, 
     return bank
 
 
-def _probe_edges(*, skip_null_on_fail: bool, use_own_cache: bool = False) -> pd.DataFrame:
+def _probe_edges(
+    *,
+    skip_null_on_fail: bool,
+    use_own_cache: bool = False,
+    share_surrogates: bool = False,
+    targets: tuple[int, ...] = (0,),
+) -> pd.DataFrame:
     values = make_planted_values(seed=2026)
     splits = full_splits()
-    target = 0
     lookback = 6
     horizon = 1
     B = 12
@@ -84,59 +121,71 @@ def _probe_edges(*, skip_null_on_fail: bool, use_own_cache: bool = False) -> pd.
         alpha_rule="val_grid",
         skip_null_on_fail=skip_null_on_fail,
     )
-    own_train = _own_design(values, target, splits.train_fit, lookback, horizon)
-    own_val = _own_design(values, target, splits.val_alpha, lookback, horizon)
-    own_cert = _own_design(values, target, splits.cert, lookback, horizon)
-    own_cache = None
-    if use_own_cache:
-        own_cache = fit_baseline_cache(
-            sources=(),
-            X_train=own_train.X,
-            y_train=own_train.y,
-            X_val=own_val.X,
-            y_val=own_val.y,
-            X_cert=own_cert.X,
-            y_cert=own_cert.y,
-            alphas=cfg.alphas,
-            alpha_rule=cfg.alpha_rule,
-            variance_eps=cfg.variance_eps,
-        )
+    all_sources = tuple(
+        sorted({source for target in targets for source in range(values.shape[1]) if source != target})
+    )
+    source_surrogates = (
+        _phase_surrogates_by_source(values, sources=all_sources, B=B, seed=seed)
+        if share_surrogates
+        else None
+    )
 
     rows = []
-    for source in (1, 2, 3):
-        source_train = _source_design(values, target, source, splits.train_fit, lookback, horizon)
-        source_val = _source_design(values, target, source, splits.val_alpha, lookback, horizon)
-        source_cert = _source_design(values, target, source, splits.cert, lookback, horizon)
-        result = probe_pairwise(
-            target=target,
-            source=source,
-            y_train=own_train.y,
-            y_val=own_val.y,
-            y_cert=own_cert.y,
-            own_train=own_train.X,
-            own_val=own_val.X,
-            own_cert=own_cert.X,
-            source_train=source_train.X,
-            source_val=source_val.X,
-            source_cert=source_cert.X,
-            own_cache=own_cache,
-            surrogate_bank=_surrogate_bank(
-                values,
+    for target in targets:
+        own_train = _own_design(values, target, splits.train_fit, lookback, horizon)
+        own_val = _own_design(values, target, splits.val_alpha, lookback, horizon)
+        own_cert = _own_design(values, target, splits.cert, lookback, horizon)
+        own_cache = None
+        if use_own_cache:
+            own_cache = fit_baseline_cache(
+                sources=(),
+                X_train=own_train.X,
+                y_train=own_train.y,
+                X_val=own_val.X,
+                y_val=own_val.y,
+                X_cert=own_cert.X,
+                y_cert=own_cert.y,
+                alphas=cfg.alphas,
+                alpha_rule=cfg.alpha_rule,
+                variance_eps=cfg.variance_eps,
+            )
+        for source in range(values.shape[1]):
+            if source == target:
+                continue
+            source_train = _source_design(values, target, source, splits.train_fit, lookback, horizon)
+            source_val = _source_design(values, target, source, splits.val_alpha, lookback, horizon)
+            source_cert = _source_design(values, target, source, splits.cert, lookback, horizon)
+            result = probe_pairwise(
                 target=target,
                 source=source,
-                splits=splits,
-                lookback=lookback,
-                horizon=horizon,
-                B=B,
-                seed=seed,
-            ),
-            config=cfg,
-        )
-        row = asdict(result)
-        row.pop("delta_null")
-        row.pop("alpha_null")
-        row["edge_type"] = EDGE_TYPES.get((target, source), "unknown")
-        rows.append(row)
+                y_train=own_train.y,
+                y_val=own_val.y,
+                y_cert=own_cert.y,
+                own_train=own_train.X,
+                own_val=own_val.X,
+                own_cert=own_cert.X,
+                source_train=source_train.X,
+                source_val=source_val.X,
+                source_cert=source_cert.X,
+                own_cache=own_cache,
+                surrogate_bank=_surrogate_bank(
+                    values,
+                    target=target,
+                    source=source,
+                    splits=splits,
+                    lookback=lookback,
+                    horizon=horizon,
+                    B=B,
+                    seed=seed,
+                    source_surrogates=source_surrogates,
+                ),
+                config=cfg,
+            )
+            row = asdict(result)
+            row.pop("delta_null")
+            row.pop("alpha_null")
+            row["edge_type"] = EDGE_TYPES.get((target, source), "unknown")
+            rows.append(row)
     return pd.DataFrame(rows).sort_values(["target", "source"]).reset_index(drop=True)
 
 
@@ -187,3 +236,35 @@ def test_own_fit_cache_preserves_certified_set_and_reduces_own_svd(monkeypatch) 
     assert _certified_set(cached) == _certified_set(uncached)
     assert uncached_own_fits == 3
     assert cached_own_fits == 1
+
+
+def test_shared_phase_surrogates_preserve_p_values_bitwise() -> None:
+    per_edge = _probe_edges(skip_null_on_fail=False, share_surrogates=False)
+    shared = _probe_edges(skip_null_on_fail=False, share_surrogates=True)
+
+    assert _certified_set(_aggregate(shared)) == _certified_set(_aggregate(per_edge))
+    np.testing.assert_array_equal(
+        shared["p_value"].to_numpy(dtype=float),
+        per_edge["p_value"].to_numpy(dtype=float),
+    )
+
+
+def test_shared_phase_surrogates_generate_once_per_source(monkeypatch) -> None:
+    module = sys.modules[__name__]
+    original = module.make_phase_surrogate
+    call_count = 0
+
+    def counting_surrogate(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(module, "make_phase_surrogate", counting_surrogate)
+    _probe_edges(skip_null_on_fail=False, share_surrogates=False, targets=(0, 1))
+    per_edge_count = call_count
+    call_count = 0
+    _probe_edges(skip_null_on_fail=False, share_surrogates=True, targets=(0, 1))
+    shared_count = call_count
+
+    assert per_edge_count == 72
+    assert shared_count == 48

@@ -88,18 +88,22 @@ def _surrogate_bank(
     B: int,
     seed: int,
     dataset: str,
+    source_surrogates: dict[int, list[np.ndarray]] | None = None,
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
     bank = []
     for surrogate_id in range(B):
-        surrogate = make_phase_surrogate(
-            values[:, source],
-            source_idx=source,
-            surrogate_id=surrogate_id,
-            seed=seed,
-            dataset=dataset,
-            split="pre_test",
-            cache_dir=None,
-        ).values
+        if source_surrogates is None:
+            surrogate = make_phase_surrogate(
+                values[:, source],
+                source_idx=source,
+                surrogate_id=surrogate_id,
+                seed=seed,
+                dataset=dataset,
+                split="pre_test",
+                cache_dir=None,
+            ).values
+        else:
+            surrogate = source_surrogates[int(source)][surrogate_id]
         s_values = values.copy()
         s_values[:, source] = surrogate
         bank.append(
@@ -110,6 +114,31 @@ def _surrogate_bank(
             )
         )
     return bank
+
+
+def _phase_surrogates_by_source(
+    values: np.ndarray,
+    *,
+    sources: tuple[int, ...],
+    B: int,
+    seed: int,
+    dataset: str,
+) -> dict[int, list[np.ndarray]]:
+    return {
+        int(source): [
+            make_phase_surrogate(
+                values[:, int(source)],
+                source_idx=int(source),
+                surrogate_id=surrogate_id,
+                seed=seed,
+                dataset=dataset,
+                split="pre_test",
+                cache_dir=None,
+            ).values
+            for surrogate_id in range(B)
+        ]
+        for source in sources
+    }
 
 
 def _pairwise_row(result) -> dict:
@@ -156,6 +185,7 @@ def _run_candidate_edge_task(task: dict) -> tuple[dict, dict]:
     source_train_by_source = task["source_train_by_source"]
     source_val_by_source = task["source_val_by_source"]
     source_cert_by_source = task["source_cert_by_source"]
+    source_surrogates = task["source_surrogates"]
     bank = _surrogate_bank(
         values,
         target=target,
@@ -166,6 +196,7 @@ def _run_candidate_edge_task(task: dict) -> tuple[dict, dict]:
         B=probe_cfg.B,
         seed=cfg.seed,
         dataset=cfg.dataset,
+        source_surrogates=source_surrogates,
     )
     pairwise = probe_pairwise(
         target=target,
@@ -296,6 +327,14 @@ def main() -> None:
 
     tasks = []
     passed = screen.edges[screen.edges["passed_screen"]].copy()
+    screened_sources = tuple(sorted(int(s) for s in passed["source"].unique()))
+    source_surrogates = _phase_surrogates_by_source(
+        loaded.values,
+        sources=screened_sources,
+        B=probe_cfg.B,
+        seed=cfg.seed,
+        dataset=cfg.dataset,
+    )
     for target in targets:
         target_screen = passed[passed["target"] == target].sort_values("screen_rank")
         group_sources = tuple(int(s) for s in target_screen["source"].tolist())
@@ -335,6 +374,7 @@ def main() -> None:
                     "source_train_by_source": source_train_by_source,
                     "source_val_by_source": source_val_by_source,
                     "source_cert_by_source": source_cert_by_source,
+                    "source_surrogates": source_surrogates,
                 }
             )
 

@@ -48,17 +48,50 @@ def _source_design(values: np.ndarray, target: int, source: int, split, lookback
     return make_lagged_design(values, target, (source,), lookback, horizon, start, end, include_own=False)
 
 
-def _surrogate_bank(values, *, target, source, splits, lookback, horizon, B, seed, dataset):
+def _phase_surrogates_by_source(values, *, sources, B, seed, dataset):
+    return {
+        int(source): [
+            make_phase_surrogate(
+                values[:, int(source)],
+                source_idx=int(source),
+                surrogate_id=surrogate_id,
+                seed=seed,
+                dataset=dataset,
+                split="pre_test",
+                cache_dir=None,
+            ).values
+            for surrogate_id in range(B)
+        ]
+        for source in sources
+    }
+
+
+def _surrogate_bank(
+    values,
+    *,
+    target,
+    source,
+    splits,
+    lookback,
+    horizon,
+    B,
+    seed,
+    dataset,
+    source_surrogates=None,
+):
     for surrogate_id in range(B):
-        surrogate = make_phase_surrogate(
-            values[:, source],
-            source_idx=source,
-            surrogate_id=surrogate_id,
-            seed=seed,
-            dataset=dataset,
-            split="pre_test",
-            cache_dir=None,
-        ).values
+        if source_surrogates is None:
+            surrogate = make_phase_surrogate(
+                values[:, source],
+                source_idx=source,
+                surrogate_id=surrogate_id,
+                seed=seed,
+                dataset=dataset,
+                split="pre_test",
+                cache_dir=None,
+            ).values
+        else:
+            surrogate = source_surrogates[int(source)][surrogate_id]
         s_values = values.copy()
         s_values[:, source] = surrogate
         yield (
@@ -108,6 +141,7 @@ def pairwise_edge_task(task: dict) -> dict:
     source_val = _source_design(values, target, source, splits.val_alpha, cfg.lookback, cfg.pred_len)
     source_cert = _source_design(values, target, source, splits.cert, cfg.lookback, cfg.pred_len)
     own_cache = task.get("own_cache")
+    source_surrogates = task.get("source_surrogates")
     result = probe_pairwise(
         target=target,
         source=source,
@@ -131,6 +165,7 @@ def pairwise_edge_task(task: dict) -> dict:
             B=cfg.B,
             seed=cfg.seed,
             dataset=cfg.dataset,
+            source_surrogates=source_surrogates,
         ),
         config=task["probe_cfg"],
     )
@@ -250,6 +285,13 @@ def run_reference_pipeline(
         else {}
     )
     own_caches = _own_caches_by_target(own_designs, probe_cfg) if precompute_own else {}
+    source_surrogates = _phase_surrogates_by_source(
+        loaded.values,
+        sources=range(n_channels),
+        B=effective_cfg.B,
+        seed=effective_cfg.seed,
+        dataset=effective_cfg.dataset,
+    )
     tasks = [
         ({
             "values": loaded.values,
@@ -258,6 +300,7 @@ def run_reference_pipeline(
             "probe_cfg": probe_cfg,
             "target": target,
             "source": source,
+            "source_surrogates": source_surrogates,
             "run_id": run_id,
             "git_hash": git_hash,
         }
