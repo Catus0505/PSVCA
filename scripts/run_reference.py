@@ -45,6 +45,7 @@ def main() -> None:
     parser.add_argument("--tier", required=True)
     parser.add_argument("--n-jobs", type=int, default=1)
     parser.add_argument("--ref-group-cap", type=int, default=None)
+    parser.add_argument("--skip-null-on-fail", action=argparse.BooleanOptionalAction, default=False)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -54,6 +55,7 @@ def main() -> None:
             tier=args.tier,
             n_jobs=args.n_jobs,
             ref_group_cap=args.ref_group_cap,
+            skip_null_on_fail=args.skip_null_on_fail,
         )
         print("summary:")
         for key, value in summary.items():
@@ -74,6 +76,7 @@ def main() -> None:
         seed=cfg.seed,
         null_method="phase",
         alpha_rule="val_grid",
+        skip_null_on_fail=args.skip_null_on_fail,
     )
     tasks = [
         {

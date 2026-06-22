@@ -270,6 +270,7 @@ def run_reference_pipeline(
     tier: str | None = None,
     n_jobs: int = 1,
     ref_group_cap: int | None = None,
+    skip_null_on_fail: bool = False,
     output_root: str | Path = "runs/phase7_reference",
 ) -> tuple[pd.DataFrame, dict, Path]:
     effective_cfg = replace(cfg, tier=tier or cfg.tier)
@@ -294,6 +295,7 @@ def run_reference_pipeline(
         seed=effective_cfg.seed,
         null_method=effective_cfg.null_method,
         alpha_rule="val_grid",
+        skip_null_on_fail=skip_null_on_fail,
     )
     run_id = make_run_id(effective_cfg)
     git_hash = get_git_hash()
