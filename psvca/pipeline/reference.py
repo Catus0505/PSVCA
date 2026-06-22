@@ -24,7 +24,7 @@ from psvca.io.artifacts import ensure_run_dir, get_git_hash, make_run_id
 from psvca.io.schema import SCHEMA_VERSION
 from psvca.linalg.design import make_lagged_design
 from psvca.nulls.phase_surrogate import make_phase_surrogate
-from psvca.pipeline.driver import CertificationDriver
+from psvca.pipeline.driver import CertificationDriver, full_group_sources
 
 
 # Weather N=21 is allowed for exact all-pair reference. ECL N=321 and
@@ -269,6 +269,7 @@ def run_reference_pipeline(
     *,
     tier: str | None = None,
     n_jobs: int = 1,
+    ref_group_cap: int | None = None,
     output_root: str | Path = "runs/phase7_reference",
 ) -> tuple[pd.DataFrame, dict, Path]:
     effective_cfg = replace(cfg, tier=tier or cfg.tier)
@@ -309,8 +310,9 @@ def run_reference_pipeline(
             dataset=effective_cfg.dataset,
             n_jobs=n_jobs_eff,
         )
-        full_edges = driver.pairwise_edges(
-            targets,
+        target_groups = full_group_sources(n_channels, ref_group_cap=ref_group_cap)
+        full_edges = driver.candidate_group_edges(
+            target_groups,
             metadata_for=_metadata_for(effective_cfg, run_id, git_hash),
         )
     else:
@@ -345,8 +347,8 @@ def run_reference_pipeline(
                 dataset=effective_cfg.dataset,
                 n_jobs=n_jobs_eff,
             )
-            block_df = block_driver.pairwise_edges(
-                targets,
+            block_df = block_driver.candidate_group_edges(
+                target_groups,
                 metadata_for=_metadata_for(effective_cfg, run_id, git_hash),
             )
         else:
@@ -365,6 +367,9 @@ def run_reference_pipeline(
         "tier": effective_cfg.tier,
         "n_edges": int(len(aggregate)),
         "n_e_certified": int(aggregate["e_certified"].sum()),
+        "certification_mode": "candidate_group",
+        "group_source": "full",
+        "ref_group_cap": None if ref_group_cap is None else int(ref_group_cap),
         "effective_B": int(effective_cfg.B),
         "N": int(n_channels),
         "m": int(per_target_m),

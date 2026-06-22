@@ -44,11 +44,17 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--tier", required=True)
     parser.add_argument("--n-jobs", type=int, default=1)
+    parser.add_argument("--ref-group-cap", type=int, default=None)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     if args.tier != "sanity":
-        edges, summary, _ = run_reference_pipeline(cfg, tier=args.tier, n_jobs=args.n_jobs)
+        edges, summary, _ = run_reference_pipeline(
+            cfg,
+            tier=args.tier,
+            n_jobs=args.n_jobs,
+            ref_group_cap=args.ref_group_cap,
+        )
         print("summary:")
         for key, value in summary.items():
             print(f"  {key}={value}")
