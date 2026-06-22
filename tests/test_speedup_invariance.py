@@ -13,10 +13,16 @@ if str(REPO_ROOT) not in sys.path:
 
 from psvca.admission.aggregate import aggregate_certified_edges
 from psvca.certify.fdr import FDRConfig, apply_bh_fdr
-from psvca.certify.probe import PairwiseProbeConfig, fit_baseline_cache, probe_pairwise
+from psvca.certify.probe import (
+    PairwiseProbeConfig,
+    fit_baseline_cache,
+    probe_candidate_group,
+    probe_pairwise,
+)
 from psvca.certify.stability import StabilityConfig, apply_stability
 from psvca.linalg.design import make_lagged_design
 from psvca.nulls.phase_surrogate import make_phase_surrogate
+from psvca.pipeline.driver import CertificationDriver
 from scripts.run_synthetic_check import EDGE_TYPES, full_splits, make_planted_values
 
 
@@ -268,3 +274,113 @@ def test_shared_phase_surrogates_generate_once_per_source(monkeypatch) -> None:
 
     assert per_edge_count == 72
     assert shared_count == 48
+
+
+def test_driver_candidate_group_cache_path_preserves_p_values() -> None:
+    values = make_planted_values(seed=2026)
+    splits = full_splits()
+    lookback = 6
+    horizon = 1
+    B = 12
+    seed = 2026
+    cfg = PairwiseProbeConfig(
+        alphas=(0.01, 0.1, 1.0, 10.0),
+        B=B,
+        seed=seed,
+        null_method="phase",
+        alpha_rule="val_grid",
+        skip_null_on_fail=False,
+    )
+    target = 0
+    group_sources = (1, 2, 3)
+    own_train = _own_design(values, target, splits.train_fit, lookback, horizon)
+    own_val = _own_design(values, target, splits.val_alpha, lookback, horizon)
+    own_cert = _own_design(values, target, splits.cert, lookback, horizon)
+    source_train = {
+        source: _source_design(values, target, source, splits.train_fit, lookback, horizon).X
+        for source in group_sources
+    }
+    source_val = {
+        source: _source_design(values, target, source, splits.val_alpha, lookback, horizon).X
+        for source in group_sources
+    }
+    source_cert = {
+        source: _source_design(values, target, source, splits.cert, lookback, horizon).X
+        for source in group_sources
+    }
+    direct = []
+    for source in group_sources:
+        result = probe_candidate_group(
+            target=target,
+            source=source,
+            group_sources=group_sources,
+            y_train=own_train.y,
+            y_val=own_val.y,
+            y_cert=own_cert.y,
+            own_train=own_train.X,
+            own_val=own_val.X,
+            own_cert=own_cert.X,
+            source_train_by_source=source_train,
+            source_val_by_source=source_val,
+            source_cert_by_source=source_cert,
+            surrogate_bank=_surrogate_bank(
+                values,
+                target=target,
+                source=source,
+                splits=splits,
+                lookback=lookback,
+                horizon=horizon,
+                B=B,
+                seed=seed,
+            ),
+            config=cfg,
+        )
+        direct.append(result.p_value)
+
+    driver = CertificationDriver(
+        values=values,
+        splits=splits,
+        lookback=lookback,
+        horizon=horizon,
+        probe_config=cfg,
+        seed=seed,
+        dataset="speedup_invariance",
+    )
+    cached = driver.candidate_group_edges({target: group_sources})
+
+    np.testing.assert_array_equal(cached["p_value"].to_numpy(dtype=float), np.asarray(direct))
+
+
+def test_driver_reuses_source_and_surrogate_designs_across_targets(monkeypatch) -> None:
+    from psvca.pipeline import driver as driver_module
+
+    original_make_lagged_design = driver_module.make_lagged_design
+    call_count = 0
+
+    def counting_make_lagged_design(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return original_make_lagged_design(*args, **kwargs)
+
+    monkeypatch.setattr(driver_module, "make_lagged_design", counting_make_lagged_design)
+    values = make_planted_values(seed=2026)
+    cfg = PairwiseProbeConfig(
+        alphas=(0.01, 0.1),
+        B=3,
+        seed=2026,
+        null_method="phase",
+        alpha_rule="val_grid",
+        skip_null_on_fail=False,
+    )
+    driver = CertificationDriver(
+        values=values,
+        splits=full_splits(),
+        lookback=6,
+        horizon=1,
+        probe_config=cfg,
+        seed=2026,
+        dataset="speedup_invariance",
+    )
+    driver.candidate_group_edges({0: (1, 2), 1: (0, 2)})
+
+    assert call_count == 42

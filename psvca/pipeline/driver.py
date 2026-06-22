@@ -47,8 +47,10 @@ class CertificationDriver:
         self.n_channels = int(self.values.shape[1])
         self._own_designs: dict[int, tuple[DesignMatrix, DesignMatrix, DesignMatrix]] = {}
         self._own_caches: dict[int, BaselineFitCache] = {}
+        self._baseline_caches: dict[tuple[int, tuple[int, ...]], BaselineFitCache] = {}
         self._source_designs: dict[int, DesignBlocks] = {}
         self._source_surrogates: dict[int, list[np.ndarray]] = {}
+        self._surrogate_designs: dict[int, list[DesignBlocks]] = {}
 
     def own_designs(self, target: int) -> tuple[DesignMatrix, DesignMatrix, DesignMatrix]:
         target = int(target)
@@ -63,20 +65,32 @@ class CertificationDriver:
     def own_cache(self, target: int) -> BaselineFitCache:
         target = int(target)
         if target not in self._own_caches:
+            self._own_caches[target] = self.baseline_cache(target, ())
+        return self._own_caches[target]
+
+    def baseline_cache(self, target: int, sources: tuple[int, ...]) -> BaselineFitCache:
+        target = int(target)
+        sources = tuple(int(s) for s in sources)
+        key = (target, sources)
+        if key not in self._baseline_caches:
             own_train, own_val, own_cert = self.own_designs(target)
-            self._own_caches[target] = fit_baseline_cache(
-                sources=(),
-                X_train=own_train.X,
+            train_blocks, val_blocks, cert_blocks = self.source_design_dicts(sources)
+            X_train = _stack_design(own_train.X, train_blocks, sources)
+            X_val = _stack_design(own_val.X, val_blocks, sources)
+            X_cert = _stack_design(own_cert.X, cert_blocks, sources)
+            self._baseline_caches[key] = fit_baseline_cache(
+                sources=sources,
+                X_train=X_train,
                 y_train=own_train.y,
-                X_val=own_val.X,
+                X_val=X_val,
                 y_val=own_val.y,
-                X_cert=own_cert.X,
+                X_cert=X_cert,
                 y_cert=own_cert.y,
                 alphas=self.probe_config.alphas,
                 alpha_rule=self.probe_config.alpha_rule,
                 variance_eps=self.probe_config.variance_eps,
             )
-        return self._own_caches[target]
+        return self._baseline_caches[key]
 
     def source_designs(self, source: int) -> DesignBlocks:
         source = int(source)
@@ -119,17 +133,33 @@ class CertificationDriver:
             ]
         return self._source_surrogates[source]
 
+    def surrogate_designs(self, source: int) -> list[DesignBlocks]:
+        source = int(source)
+        if source not in self._surrogate_designs:
+            target = self._dummy_target(source)
+            designs = []
+            for surrogate in self.phase_surrogates(source):
+                s_values = self.values.copy()
+                s_values[:, source] = surrogate
+                designs.append(
+                    DesignBlocks(
+                        train=self._source_design(
+                            target, source, self.splits.train_fit, values=s_values
+                        ).X,
+                        val=self._source_design(
+                            target, source, self.splits.val_alpha, values=s_values
+                        ).X,
+                        cert=self._source_design(target, source, self.splits.cert, values=s_values).X,
+                    )
+                )
+            self._surrogate_designs[source] = designs
+        return self._surrogate_designs[source]
+
     def surrogate_bank(self, *, target: int, source: int):
         source = int(source)
-        target = int(target)
-        for surrogate in self.phase_surrogates(source):
-            s_values = self.values.copy()
-            s_values[:, source] = surrogate
-            yield (
-                self._source_design(target, source, self.splits.train_fit, values=s_values).X,
-                self._source_design(target, source, self.splits.val_alpha, values=s_values).X,
-                self._source_design(target, source, self.splits.cert, values=s_values).X,
-            )
+        del target
+        for blocks in self.surrogate_designs(source):
+            yield (blocks.train, blocks.val, blocks.cert)
 
     def probe_pairwise_row(self, *, target: int, source: int, metadata: dict | None = None) -> dict:
         target = int(target)
@@ -172,6 +202,7 @@ class CertificationDriver:
         group_sources = tuple(int(s) for s in group_sources)
         own_train, own_val, own_cert = self.own_designs(target)
         source_train, source_val, source_cert = self.source_design_dicts(group_sources)
+        other_sources = tuple(s for s in group_sources if s != source)
         result = probe_candidate_group(
             target=target,
             source=source,
@@ -185,6 +216,7 @@ class CertificationDriver:
             source_train_by_source=source_train,
             source_val_by_source=source_val,
             source_cert_by_source=source_cert,
+            reduced_cache=self.baseline_cache(target, other_sources),
             surrogate_bank=self.surrogate_bank(target=target, source=source),
             group_id=group_id,
             n_jobs=self.n_jobs,
@@ -222,6 +254,9 @@ class CertificationDriver:
             group_sources = tuple(int(s) for s in group_sources if int(s) != int(target))
             if not group_sources:
                 continue
+            for source in group_sources:
+                other_sources = tuple(s for s in group_sources if s != source)
+                self.baseline_cache(int(target), other_sources)
             group_id = f"target_{int(target)}_top{len(group_sources)}"
             for source in group_sources:
                 metadata = metadata_for(int(target), int(source)) if metadata_for else None
@@ -283,6 +318,12 @@ def full_group_sources(n_channels: int, *, ref_group_cap: int | None = None) -> 
             sources = sources[: int(ref_group_cap)]
         groups[target] = sources
     return groups
+
+
+def _stack_design(own: np.ndarray, blocks: dict[int, np.ndarray], sources: tuple[int, ...]) -> np.ndarray:
+    if not sources:
+        return own
+    return np.column_stack([own, *(blocks[int(source)] for source in sources)])
 
 
 def _result_row(result) -> dict:
