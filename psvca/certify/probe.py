@@ -19,6 +19,8 @@ class PairwiseProbeConfig:
     alpha_rule: str = "val_grid"
     variance_eps: float = 1e-12
     sparse_eps: float = 1e-12
+    skip_null_on_fail: bool = False
+    delta_floor: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,7 @@ class PairwiseProbeResult:
     sparse_zero: bool
     unstable_metric: bool
     certified_candidate: bool
+    skipped_null: bool
     n_train_fit: int
     n_val_alpha: int
     n_cert: int
@@ -70,6 +73,7 @@ class CandidateGroupProbeResult:
     sparse_zero: bool
     unstable_metric: bool
     certified_candidate: bool
+    skipped_null: bool
     n_train_fit: int
     n_val_alpha: int
     n_cert: int
@@ -268,63 +272,70 @@ def probe_pairwise(
 
     delta_null = []
     alpha_null = []
-    bank_iter = iter(surrogate_bank) if surrogate_bank is not None else None
-    if bank_iter is None and config.null_method == "phase":
-        raise ValueError(
-            "phase null for lagged designs requires source-level surrogate_bank"
-        )
-    for b in range(config.B):
+    skipped_null = bool(config.skip_null_on_fail and delta_true <= config.delta_floor)
+    if not skipped_null:
+        bank_iter = iter(surrogate_bank) if surrogate_bank is not None else None
+        if bank_iter is None and config.null_method == "phase":
+            raise ValueError(
+                "phase null for lagged designs requires source-level surrogate_bank"
+            )
+        for b in range(config.B):
+            if bank_iter is not None:
+                try:
+                    entry = next(bank_iter)
+                except StopIteration as exc:
+                    raise ValueError("surrogate_bank yielded fewer than B") from exc
+                s_train, s_val, s_cert = _surrogate_blocks(entry)
+                s_train = _as_2d(s_train, f"surrogate_train_{b}")
+                s_val = _as_2d(s_val, f"surrogate_val_{b}")
+                s_cert = _as_2d(s_cert, f"surrogate_cert_{b}")
+            elif config.null_method == "row_perm":
+                s_train, s_val, s_cert = _row_permute_design(
+                    source_train_arr,
+                    source_val_arr,
+                    source_cert_arr,
+                    seed=config.seed,
+                    surrogate_id=b,
+                )
+            else:
+                raise ValueError(f"unsupported null_method: {config.null_method}")
+
+            null_train = np.column_stack([own_train_arr, s_train])
+            null_val = np.column_stack([own_val_arr, s_val])
+            null_cert = np.column_stack([own_cert_arr, s_cert])
+            null_path, alpha_b = _fit_select_alpha(
+                X_train=null_train,
+                y_train=y_train_arr,
+                X_val=null_val,
+                y_val=y_val_arr,
+                alphas=alphas,
+                alpha_rule=config.alpha_rule,
+            )
+            pred_null_cert = null_path.predict(null_cert, alpha_b)
+            delta_b = _delta_from_predictions(
+                y_cert=y_cert_arr,
+                pred_own=pred_own_cert,
+                pred_joint=pred_null_cert,
+                variance_eps=config.variance_eps,
+            )
+            delta_null.append(delta_b)
+            alpha_null.append(alpha_b)
         if bank_iter is not None:
             try:
-                entry = next(bank_iter)
-            except StopIteration as exc:
-                raise ValueError("surrogate_bank yielded fewer than B") from exc
-            s_train, s_val, s_cert = _surrogate_blocks(entry)
-            s_train = _as_2d(s_train, f"surrogate_train_{b}")
-            s_val = _as_2d(s_val, f"surrogate_val_{b}")
-            s_cert = _as_2d(s_cert, f"surrogate_cert_{b}")
-        elif config.null_method == "row_perm":
-            s_train, s_val, s_cert = _row_permute_design(
-                source_train_arr,
-                source_val_arr,
-                source_cert_arr,
-                seed=config.seed,
-                surrogate_id=b,
-            )
-        else:
-            raise ValueError(f"unsupported null_method: {config.null_method}")
-
-        null_train = np.column_stack([own_train_arr, s_train])
-        null_val = np.column_stack([own_val_arr, s_val])
-        null_cert = np.column_stack([own_cert_arr, s_cert])
-        null_path, alpha_b = _fit_select_alpha(
-            X_train=null_train,
-            y_train=y_train_arr,
-            X_val=null_val,
-            y_val=y_val_arr,
-            alphas=alphas,
-            alpha_rule=config.alpha_rule,
-        )
-        pred_null_cert = null_path.predict(null_cert, alpha_b)
-        delta_b = _delta_from_predictions(
-            y_cert=y_cert_arr,
-            pred_own=pred_own_cert,
-            pred_joint=pred_null_cert,
-            variance_eps=config.variance_eps,
-        )
-        delta_null.append(delta_b)
-        alpha_null.append(alpha_b)
-    if bank_iter is not None:
-        try:
-            next(bank_iter)
-        except StopIteration:
-            pass
-        else:
-            raise ValueError("surrogate_bank yielded more than B")
+                next(bank_iter)
+            except StopIteration:
+                pass
+            else:
+                raise ValueError("surrogate_bank yielded more than B")
 
     delta_null_arr = np.asarray(delta_null, dtype=np.float64)
     alpha_null_arr = np.asarray(alpha_null, dtype=np.float64)
-    if np.isfinite(delta_true) and np.all(np.isfinite(delta_null_arr)):
+    if skipped_null:
+        delta_null_mean = float("nan")
+        delta_null_std = float("nan")
+        aligned_gain = float("nan")
+        p_value = 1.0
+    elif np.isfinite(delta_true) and np.all(np.isfinite(delta_null_arr)):
         delta_null_mean = float(delta_null_arr.mean())
         delta_null_std = float(delta_null_arr.std())
         aligned_gain = float(delta_true - delta_null_mean)
@@ -364,6 +375,7 @@ def probe_pairwise(
         sparse_zero=gates.sparse_zero,
         unstable_metric=gates.unstable_metric,
         certified_candidate=gates.certified_candidate,
+        skipped_null=skipped_null,
         n_train_fit=int(len(y_train_arr)),
         n_val_alpha=int(len(y_val_arr)),
         n_cert=int(len(y_cert_arr)),
@@ -475,72 +487,79 @@ def probe_candidate_group(
 
     delta_null = []
     alpha_null = []
-    bank_iter = iter(surrogate_bank) if surrogate_bank is not None else None
-    if bank_iter is None and config.null_method == "phase":
-        raise ValueError(
-            "phase null for lagged designs requires source-level surrogate_bank"
-        )
-    for b in range(config.B):
+    skipped_null = bool(config.skip_null_on_fail and delta_true <= config.delta_floor)
+    if not skipped_null:
+        bank_iter = iter(surrogate_bank) if surrogate_bank is not None else None
+        if bank_iter is None and config.null_method == "phase":
+            raise ValueError(
+                "phase null for lagged designs requires source-level surrogate_bank"
+            )
+        for b in range(config.B):
+            if bank_iter is not None:
+                try:
+                    entry = next(bank_iter)
+                except StopIteration as exc:
+                    raise ValueError("surrogate_bank yielded fewer than B") from exc
+                s_train, s_val, s_cert = _surrogate_blocks(entry)
+                s_train = _as_2d(s_train, f"surrogate_train_{b}")
+                s_val = _as_2d(s_val, f"surrogate_val_{b}")
+                s_cert = _as_2d(s_cert, f"surrogate_cert_{b}")
+            elif config.null_method == "row_perm":
+                s_train, s_val, s_cert = _row_permute_design(
+                    train_blocks[source],
+                    val_blocks[source],
+                    cert_blocks[source],
+                    seed=config.seed,
+                    surrogate_id=b,
+                )
+            else:
+                raise ValueError(f"unsupported null_method: {config.null_method}")
+            _check_rows(y_train_arr, s_train, "y_train", f"surrogate_train_{b}")
+            _check_rows(y_val_arr, s_val, "y_val", f"surrogate_val_{b}")
+            _check_rows(y_cert_arr, s_cert, "y_cert", f"surrogate_cert_{b}")
+
+            null_train_blocks = dict(train_blocks)
+            null_val_blocks = dict(val_blocks)
+            null_cert_blocks = dict(cert_blocks)
+            null_train_blocks[source] = s_train
+            null_val_blocks[source] = s_val
+            null_cert_blocks[source] = s_cert
+            null_train = stack_design(own_train_arr, null_train_blocks, group_sources)
+            null_val = stack_design(own_val_arr, null_val_blocks, group_sources)
+            null_cert = stack_design(own_cert_arr, null_cert_blocks, group_sources)
+            null_path, alpha_b = _fit_select_alpha(
+                X_train=null_train,
+                y_train=y_train_arr,
+                X_val=null_val,
+                y_val=y_val_arr,
+                alphas=alphas,
+                alpha_rule=config.alpha_rule,
+            )
+            pred_null_cert = null_path.predict(null_cert, alpha_b)
+            delta_b = _delta_reduced_full(
+                y_cert=y_cert_arr,
+                pred_reduced=pred_reduced_cert,
+                pred_full=pred_null_cert,
+                variance_eps=config.variance_eps,
+            )
+            delta_null.append(delta_b)
+            alpha_null.append(alpha_b)
         if bank_iter is not None:
             try:
-                entry = next(bank_iter)
-            except StopIteration as exc:
-                raise ValueError("surrogate_bank yielded fewer than B") from exc
-            s_train, s_val, s_cert = _surrogate_blocks(entry)
-            s_train = _as_2d(s_train, f"surrogate_train_{b}")
-            s_val = _as_2d(s_val, f"surrogate_val_{b}")
-            s_cert = _as_2d(s_cert, f"surrogate_cert_{b}")
-        elif config.null_method == "row_perm":
-            s_train, s_val, s_cert = _row_permute_design(
-                train_blocks[source],
-                val_blocks[source],
-                cert_blocks[source],
-                seed=config.seed,
-                surrogate_id=b,
-            )
-        else:
-            raise ValueError(f"unsupported null_method: {config.null_method}")
-        _check_rows(y_train_arr, s_train, "y_train", f"surrogate_train_{b}")
-        _check_rows(y_val_arr, s_val, "y_val", f"surrogate_val_{b}")
-        _check_rows(y_cert_arr, s_cert, "y_cert", f"surrogate_cert_{b}")
-
-        null_train_blocks = dict(train_blocks)
-        null_val_blocks = dict(val_blocks)
-        null_cert_blocks = dict(cert_blocks)
-        null_train_blocks[source] = s_train
-        null_val_blocks[source] = s_val
-        null_cert_blocks[source] = s_cert
-        null_train = stack_design(own_train_arr, null_train_blocks, group_sources)
-        null_val = stack_design(own_val_arr, null_val_blocks, group_sources)
-        null_cert = stack_design(own_cert_arr, null_cert_blocks, group_sources)
-        null_path, alpha_b = _fit_select_alpha(
-            X_train=null_train,
-            y_train=y_train_arr,
-            X_val=null_val,
-            y_val=y_val_arr,
-            alphas=alphas,
-            alpha_rule=config.alpha_rule,
-        )
-        pred_null_cert = null_path.predict(null_cert, alpha_b)
-        delta_b = _delta_reduced_full(
-            y_cert=y_cert_arr,
-            pred_reduced=pred_reduced_cert,
-            pred_full=pred_null_cert,
-            variance_eps=config.variance_eps,
-        )
-        delta_null.append(delta_b)
-        alpha_null.append(alpha_b)
-    if bank_iter is not None:
-        try:
-            next(bank_iter)
-        except StopIteration:
-            pass
-        else:
-            raise ValueError("surrogate_bank yielded more than B")
+                next(bank_iter)
+            except StopIteration:
+                pass
+            else:
+                raise ValueError("surrogate_bank yielded more than B")
 
     delta_null_arr = np.asarray(delta_null, dtype=np.float64)
     alpha_null_arr = np.asarray(alpha_null, dtype=np.float64)
-    if np.isfinite(delta_true) and np.all(np.isfinite(delta_null_arr)):
+    if skipped_null:
+        delta_null_mean = float("nan")
+        delta_null_std = float("nan")
+        aligned_gain = float("nan")
+        p_value = 1.0
+    elif np.isfinite(delta_true) and np.all(np.isfinite(delta_null_arr)):
         delta_null_mean = float(delta_null_arr.mean())
         delta_null_std = float(delta_null_arr.std())
         aligned_gain = float(delta_true - delta_null_mean)
@@ -584,6 +603,7 @@ def probe_candidate_group(
         sparse_zero=gates.sparse_zero,
         unstable_metric=gates.unstable_metric,
         certified_candidate=gates.certified_candidate,
+        skipped_null=skipped_null,
         n_train_fit=int(len(y_train_arr)),
         n_val_alpha=int(len(y_val_arr)),
         n_cert=int(len(y_cert_arr)),

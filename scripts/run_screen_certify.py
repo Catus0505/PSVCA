@@ -260,6 +260,8 @@ def main() -> None:
         seed=cfg.seed,
         null_method="phase",
         alpha_rule="val_grid",
+        skip_null_on_fail=True,
+        delta_floor=0.0,
     )
     own_by_target = {
         target: (
