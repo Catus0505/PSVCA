@@ -12,7 +12,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from psvca.admission.aggregate import aggregate_certified_edges
 from psvca.certify.fdr import FDRConfig, apply_bh_fdr
-from psvca.certify.probe import PairwiseProbeConfig, probe_pairwise
+from psvca.certify.probe import PairwiseProbeConfig, fit_baseline_cache, probe_pairwise
 from psvca.certify.stability import StabilityConfig, apply_stability
 from psvca.linalg.design import make_lagged_design
 from psvca.nulls.phase_surrogate import make_phase_surrogate
@@ -68,7 +68,7 @@ def _surrogate_bank(values, *, target: int, source: int, splits, lookback: int, 
     return bank
 
 
-def _probe_edges(*, skip_null_on_fail: bool) -> pd.DataFrame:
+def _probe_edges(*, skip_null_on_fail: bool, use_own_cache: bool = False) -> pd.DataFrame:
     values = make_planted_values(seed=2026)
     splits = full_splits()
     target = 0
@@ -87,6 +87,20 @@ def _probe_edges(*, skip_null_on_fail: bool) -> pd.DataFrame:
     own_train = _own_design(values, target, splits.train_fit, lookback, horizon)
     own_val = _own_design(values, target, splits.val_alpha, lookback, horizon)
     own_cert = _own_design(values, target, splits.cert, lookback, horizon)
+    own_cache = None
+    if use_own_cache:
+        own_cache = fit_baseline_cache(
+            sources=(),
+            X_train=own_train.X,
+            y_train=own_train.y,
+            X_val=own_val.X,
+            y_val=own_val.y,
+            X_cert=own_cert.X,
+            y_cert=own_cert.y,
+            alphas=cfg.alphas,
+            alpha_rule=cfg.alpha_rule,
+            variance_eps=cfg.variance_eps,
+        )
 
     rows = []
     for source in (1, 2, 3):
@@ -105,6 +119,7 @@ def _probe_edges(*, skip_null_on_fail: bool) -> pd.DataFrame:
             source_train=source_train.X,
             source_val=source_val.X,
             source_cert=source_cert.X,
+            own_cache=own_cache,
             surrogate_bank=_surrogate_bank(
                 values,
                 target=target,
@@ -148,3 +163,27 @@ def test_skip_null_on_first_gate_failure_preserves_certified_set() -> None:
     skipped_rows = skipped[skipped["skipped_null"]]
     assert skipped_rows["p_value"].eq(1.0).all()
     assert not skipped_rows["certified_candidate"].any()
+
+
+def test_own_fit_cache_preserves_certified_set_and_reduces_own_svd(monkeypatch) -> None:
+    from psvca.certify import probe as probe_module
+
+    original_fit = probe_module.fit_ridge_path
+    own_fit_count = 0
+
+    def counting_fit(X, y, alphas):
+        nonlocal own_fit_count
+        if X.shape[1] == 6:
+            own_fit_count += 1
+        return original_fit(X, y, alphas)
+
+    monkeypatch.setattr(probe_module, "fit_ridge_path", counting_fit)
+    uncached = _aggregate(_probe_edges(skip_null_on_fail=False, use_own_cache=False))
+    uncached_own_fits = own_fit_count
+    own_fit_count = 0
+    cached = _aggregate(_probe_edges(skip_null_on_fail=False, use_own_cache=True))
+    cached_own_fits = own_fit_count
+
+    assert _certified_set(cached) == _certified_set(uncached)
+    assert uncached_own_fits == 3
+    assert cached_own_fits == 1

@@ -11,7 +11,12 @@ import pandas as pd
 
 from psvca.admission.aggregate import aggregate_certified_edges
 from psvca.certify.fdr import FDRConfig, apply_bh_fdr
-from psvca.certify.probe import PairwiseProbeConfig, normalize_n_jobs, probe_pairwise
+from psvca.certify.probe import (
+    PairwiseProbeConfig,
+    fit_baseline_cache,
+    normalize_n_jobs,
+    probe_pairwise,
+)
 from psvca.certify.stability import StabilityConfig, apply_stability
 from psvca.config import PSVCAConfig, config_hash
 from psvca.data.loader import load_series
@@ -93,12 +98,16 @@ def pairwise_edge_task(task: dict) -> dict:
     splits = task["splits"]
     target = int(task["target"])
     source = int(task["source"])
-    own_train = _own_design(values, target, splits.train_fit, cfg.lookback, cfg.pred_len)
-    own_val = _own_design(values, target, splits.val_alpha, cfg.lookback, cfg.pred_len)
-    own_cert = _own_design(values, target, splits.cert, cfg.lookback, cfg.pred_len)
+    if "own_designs" in task:
+        own_train, own_val, own_cert = task["own_designs"]
+    else:
+        own_train = _own_design(values, target, splits.train_fit, cfg.lookback, cfg.pred_len)
+        own_val = _own_design(values, target, splits.val_alpha, cfg.lookback, cfg.pred_len)
+        own_cert = _own_design(values, target, splits.cert, cfg.lookback, cfg.pred_len)
     source_train = _source_design(values, target, source, splits.train_fit, cfg.lookback, cfg.pred_len)
     source_val = _source_design(values, target, source, splits.val_alpha, cfg.lookback, cfg.pred_len)
     source_cert = _source_design(values, target, source, splits.cert, cfg.lookback, cfg.pred_len)
+    own_cache = task.get("own_cache")
     result = probe_pairwise(
         target=target,
         source=source,
@@ -111,6 +120,7 @@ def pairwise_edge_task(task: dict) -> dict:
         source_train=source_train.X,
         source_val=source_val.X,
         source_cert=source_cert.X,
+        own_cache=own_cache,
         surrogate_bank=_surrogate_bank(
             values,
             target=target,
@@ -133,6 +143,9 @@ def _edge_task(task: dict) -> dict:
     return pairwise_edge_task(task)
 
 
+_DEFAULT_EDGE_TASK = _edge_task
+
+
 def _run_edge_tasks(tasks, n_jobs_eff):
     if n_jobs_eff <= 1 or len(tasks) <= 1:
         return [_edge_task(task) for task in tasks]
@@ -147,6 +160,35 @@ def _run_edge_tasks(tasks, n_jobs_eff):
 
     with mp.Pool(processes=max_workers, maxtasksperchild=2) as pool:
         return list(pool.map(_edge_task, tasks))
+
+
+def _own_designs_by_target(values, splits, cfg: PSVCAConfig, targets: range | tuple[int, ...]):
+    return {
+        target: (
+            _own_design(values, target, splits.train_fit, cfg.lookback, cfg.pred_len),
+            _own_design(values, target, splits.val_alpha, cfg.lookback, cfg.pred_len),
+            _own_design(values, target, splits.cert, cfg.lookback, cfg.pred_len),
+        )
+        for target in targets
+    }
+
+
+def _own_caches_by_target(own_designs, probe_cfg: PairwiseProbeConfig):
+    caches = {}
+    for target, (own_train, own_val, own_cert) in own_designs.items():
+        caches[target] = fit_baseline_cache(
+            sources=(),
+            X_train=own_train.X,
+            y_train=own_train.y,
+            X_val=own_val.X,
+            y_val=own_val.y,
+            X_cert=own_cert.X,
+            y_cert=own_cert.y,
+            alphas=probe_cfg.alphas,
+            alpha_rule=probe_cfg.alpha_rule,
+            variance_eps=probe_cfg.variance_eps,
+        )
+    return caches
 
 
 def _cert_blocks(splits, k: int):
@@ -200,8 +242,16 @@ def run_reference_pipeline(
     )
     run_id = make_run_id(effective_cfg)
     git_hash = get_git_hash()
+    targets = range(n_channels)
+    precompute_own = _edge_task is _DEFAULT_EDGE_TASK
+    own_designs = (
+        _own_designs_by_target(loaded.values, loaded.splits, effective_cfg, targets)
+        if precompute_own
+        else {}
+    )
+    own_caches = _own_caches_by_target(own_designs, probe_cfg) if precompute_own else {}
     tasks = [
-        {
+        ({
             "values": loaded.values,
             "splits": loaded.splits,
             "cfg": effective_cfg,
@@ -211,7 +261,15 @@ def run_reference_pipeline(
             "run_id": run_id,
             "git_hash": git_hash,
         }
-        for target in range(n_channels)
+        | (
+            {
+                "own_designs": own_designs[target],
+                "own_cache": own_caches[target],
+            }
+            if precompute_own
+            else {}
+        ))
+        for target in targets
         for source in range(n_channels)
         if source != target
     ]
@@ -220,7 +278,26 @@ def run_reference_pipeline(
     fdr_edges = _apply_bh_fdr_per_target(full_edges, FDRConfig(q=0.1, min_B_for_formal=200))
     block_edges = []
     for block_splits in _cert_blocks(loaded.splits, max(1, effective_cfg.stability_blocks)):
-        block_tasks = [{**task, "splits": block_splits} for task in tasks]
+        block_own_designs = (
+            _own_designs_by_target(loaded.values, block_splits, effective_cfg, targets)
+            if precompute_own
+            else {}
+        )
+        block_own_caches = _own_caches_by_target(block_own_designs, probe_cfg) if precompute_own else {}
+        block_tasks = [
+            (
+                {**task, "splits": block_splits}
+                | (
+                    {
+                        "own_designs": block_own_designs[int(task["target"])],
+                        "own_cache": block_own_caches[int(task["target"])],
+                    }
+                    if precompute_own
+                    else {}
+                )
+            )
+            for task in tasks
+        ]
         block_rows = _run_edge_tasks(block_tasks, n_jobs_eff)
         block_edges.append(_apply_bh_fdr_per_target(pd.DataFrame(block_rows), FDRConfig(q=0.1, min_B_for_formal=200)))
     stable = apply_stability(fdr_edges, block_edges, StabilityConfig()).edges

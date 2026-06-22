@@ -24,6 +24,20 @@ class PairwiseProbeConfig:
 
 
 @dataclass(frozen=True)
+class BaselineFitCache:
+    sources: tuple[int, ...]
+    X_train: np.ndarray
+    X_val: np.ndarray
+    X_cert: np.ndarray
+    path: RidgePath
+    alpha: float
+    pred_train: np.ndarray
+    pred_val: np.ndarray
+    pred_cert: np.ndarray
+    r2_cert: float
+
+
+@dataclass(frozen=True)
 class PairwiseProbeResult:
     target: int
     source: int
@@ -167,6 +181,67 @@ def _delta_reduced_full(
     )
 
 
+def _r2_score(*, y_true: np.ndarray, pred: np.ndarray, variance_eps: float) -> float:
+    centered = y_true - y_true.mean()
+    sst = float(np.sum(centered * centered))
+    if sst <= variance_eps:
+        return float("nan")
+    sse = float(np.sum((y_true - pred) ** 2))
+    return 1.0 - sse / sst
+
+
+def fit_baseline_cache(
+    *,
+    sources: tuple[int, ...] = (),
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    X_cert,
+    y_cert,
+    alphas,
+    alpha_rule: str,
+    variance_eps: float = 1e-12,
+) -> BaselineFitCache:
+    X_train_arr = _as_2d(X_train, "baseline_X_train")
+    X_val_arr = _as_2d(X_val, "baseline_X_val")
+    X_cert_arr = _as_2d(X_cert, "baseline_X_cert")
+    y_train_arr = _as_1d(y_train, "baseline_y_train")
+    y_val_arr = _as_1d(y_val, "baseline_y_val")
+    y_cert_arr = _as_1d(y_cert, "baseline_y_cert")
+    for y, X, y_name, x_name in (
+        (y_train_arr, X_train_arr, "baseline_y_train", "baseline_X_train"),
+        (y_val_arr, X_val_arr, "baseline_y_val", "baseline_X_val"),
+        (y_cert_arr, X_cert_arr, "baseline_y_cert", "baseline_X_cert"),
+    ):
+        _check_rows(y, X, y_name, x_name)
+
+    alpha_arr = np.asarray(alphas, dtype=np.float64)
+    path, alpha = _fit_select_alpha(
+        X_train=X_train_arr,
+        y_train=y_train_arr,
+        X_val=X_val_arr,
+        y_val=y_val_arr,
+        alphas=alpha_arr,
+        alpha_rule=alpha_rule,
+    )
+    pred_train = path.predict(X_train_arr, alpha)
+    pred_val = path.predict(X_val_arr, alpha)
+    pred_cert = path.predict(X_cert_arr, alpha)
+    return BaselineFitCache(
+        sources=tuple(int(s) for s in sources),
+        X_train=X_train_arr,
+        X_val=X_val_arr,
+        X_cert=X_cert_arr,
+        path=path,
+        alpha=float(alpha),
+        pred_train=pred_train,
+        pred_val=pred_val,
+        pred_cert=pred_cert,
+        r2_cert=float(_r2_score(y_true=y_cert_arr, pred=pred_cert, variance_eps=variance_eps)),
+    )
+
+
 def _row_permute_design(
     X_train: np.ndarray,
     X_val: np.ndarray,
@@ -211,6 +286,7 @@ def probe_pairwise(
     source_train,
     source_val,
     source_cert,
+    own_cache: BaselineFitCache | None = None,
     surrogate_bank=None,
     config: PairwiseProbeConfig,
 ) -> PairwiseProbeResult:
@@ -241,15 +317,30 @@ def probe_pairwise(
     ):
         _check_rows(y, X, y_name, x_name)
 
-    own_path, alpha_own = _fit_select_alpha(
-        X_train=own_train_arr,
-        y_train=y_train_arr,
-        X_val=own_val_arr,
-        y_val=y_val_arr,
-        alphas=alphas,
-        alpha_rule=config.alpha_rule,
-    )
-    pred_own_cert = own_path.predict(own_cert_arr, alpha_own)
+    if own_cache is None:
+        own_cache = fit_baseline_cache(
+            sources=(),
+            X_train=own_train_arr,
+            y_train=y_train_arr,
+            X_val=own_val_arr,
+            y_val=y_val_arr,
+            X_cert=own_cert_arr,
+            y_cert=y_cert_arr,
+            alphas=alphas,
+            alpha_rule=config.alpha_rule,
+            variance_eps=config.variance_eps,
+        )
+    elif own_cache.sources != ():
+        raise ValueError("pairwise own_cache must have sources=()")
+    for cached, actual, name in (
+        (own_cache.X_train, own_train_arr, "own_train"),
+        (own_cache.X_val, own_val_arr, "own_val"),
+        (own_cache.X_cert, own_cert_arr, "own_cert"),
+    ):
+        if cached.shape != actual.shape or not np.array_equal(cached, actual):
+            raise ValueError(f"own_cache does not match {name}")
+    alpha_own = own_cache.alpha
+    pred_own_cert = own_cache.pred_cert
 
     joint_train = np.column_stack([own_train_arr, source_train_arr])
     joint_val = np.column_stack([own_val_arr, source_val_arr])
@@ -396,6 +487,7 @@ def probe_candidate_group(
     source_train_by_source: dict[int, np.ndarray],
     source_val_by_source: dict[int, np.ndarray],
     source_cert_by_source: dict[int, np.ndarray],
+    reduced_cache: BaselineFitCache | None = None,
     surrogate_bank=None,
     group_id: str | None = None,
     n_jobs: int = 1,
@@ -460,15 +552,26 @@ def probe_candidate_group(
     full_val = stack_design(own_val_arr, val_blocks, group_sources)
     full_cert = stack_design(own_cert_arr, cert_blocks, group_sources)
 
-    reduced_path, alpha_reduced = _fit_select_alpha(
-        X_train=reduced_train,
-        y_train=y_train_arr,
-        X_val=reduced_val,
-        y_val=y_val_arr,
-        alphas=alphas,
-        alpha_rule=config.alpha_rule,
-    )
-    pred_reduced_cert = reduced_path.predict(reduced_cert, alpha_reduced)
+    if reduced_cache is not None and reduced_cache.sources == other_sources:
+        for cached, actual, name in (
+            (reduced_cache.X_train, reduced_train, "reduced_train"),
+            (reduced_cache.X_val, reduced_val, "reduced_val"),
+            (reduced_cache.X_cert, reduced_cert, "reduced_cert"),
+        ):
+            if cached.shape != actual.shape or not np.array_equal(cached, actual):
+                raise ValueError(f"reduced_cache does not match {name}")
+        alpha_reduced = reduced_cache.alpha
+        pred_reduced_cert = reduced_cache.pred_cert
+    else:
+        reduced_path, alpha_reduced = _fit_select_alpha(
+            X_train=reduced_train,
+            y_train=y_train_arr,
+            X_val=reduced_val,
+            y_val=y_val_arr,
+            alphas=alphas,
+            alpha_rule=config.alpha_rule,
+        )
+        pred_reduced_cert = reduced_path.predict(reduced_cert, alpha_reduced)
     full_path, alpha_full = _fit_select_alpha(
         X_train=full_train,
         y_train=y_train_arr,

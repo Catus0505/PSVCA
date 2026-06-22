@@ -21,7 +21,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from psvca.certify.probe import PairwiseProbeConfig, probe_candidate_group, probe_pairwise
+from psvca.certify.probe import (
+    PairwiseProbeConfig,
+    fit_baseline_cache,
+    probe_candidate_group,
+    probe_pairwise,
+)
 from psvca.certify.probe import normalize_n_jobs
 from psvca.config import load_config
 from psvca.data.loader import load_series
@@ -147,6 +152,7 @@ def _run_candidate_edge_task(task: dict) -> tuple[dict, dict]:
     splits = task["splits"]
     values = task["values"]
     own_train, own_val, own_cert = task["own_designs"]
+    own_cache = task["own_cache"]
     source_train_by_source = task["source_train_by_source"]
     source_val_by_source = task["source_val_by_source"]
     source_cert_by_source = task["source_cert_by_source"]
@@ -173,6 +179,7 @@ def _run_candidate_edge_task(task: dict) -> tuple[dict, dict]:
         source_train=source_train_by_source[source],
         source_val=source_val_by_source[source],
         source_cert=source_cert_by_source[source],
+        own_cache=own_cache,
         surrogate_bank=bank,
         config=probe_cfg,
     )
@@ -271,6 +278,21 @@ def main() -> None:
         )
         for target in targets
     }
+    own_cache_by_target = {
+        target: fit_baseline_cache(
+            sources=(),
+            X_train=own_train.X,
+            y_train=own_train.y,
+            X_val=own_val.X,
+            y_val=own_val.y,
+            X_cert=own_cert.X,
+            y_cert=own_cert.y,
+            alphas=probe_cfg.alphas,
+            alpha_rule=probe_cfg.alpha_rule,
+            variance_eps=probe_cfg.variance_eps,
+        )
+        for target, (own_train, own_val, own_cert) in own_by_target.items()
+    }
 
     tasks = []
     passed = screen.edges[screen.edges["passed_screen"]].copy()
@@ -309,6 +331,7 @@ def main() -> None:
                     "probe_cfg": probe_cfg,
                     "n_jobs": n_jobs,
                     "own_designs": own_by_target[target],
+                    "own_cache": own_cache_by_target[target],
                     "source_train_by_source": source_train_by_source,
                     "source_val_by_source": source_val_by_source,
                     "source_cert_by_source": source_cert_by_source,
