@@ -24,7 +24,7 @@ from psvca.certify.probe import normalize_n_jobs
 from psvca.config import load_config
 from psvca.data.loader import load_series
 from psvca.io.artifacts import ensure_run_dir, make_run_id
-from psvca.pipeline.driver import CertificationDriver
+from psvca.pipeline.driver import CertificationDriver, workload_summary
 from psvca.screen.value_screen import ValueScreenConfig, run_value_screen
 
 
@@ -127,6 +127,7 @@ def main() -> None:
         target_groups,
         metadata_for=lambda target, source: screen_meta[(target, source)],
     )
+    candidate_workload = workload_summary(candidate_df, mode="candidate_group", B=probe_cfg.B)
     pairwise_rows = [
         driver.probe_pairwise_row(
             target=target,
@@ -167,12 +168,24 @@ def main() -> None:
         "dataset": cfg.dataset,
         "pred_len": int(cfg.pred_len),
         "tier": args.tier,
+        "effective_B": int(B),
+        "group_size": candidate_workload["group_size"],
+        "group_size_min": candidate_workload["group_size_min"],
+        "group_size_max": candidate_workload["group_size_max"],
+        "group_size_mean": candidate_workload["group_size_mean"],
         "n_targets_screened": int(screen.summary["n_targets_screened"]),
         "top_m": int(top_m),
         "n_screen_edges": int(screen.summary["n_screen_edges"]),
         "spearman_screen_vs_pairwise_delta": spearman_r,
         "spearman_pvalue": spearman_p,
         "n_candidate_group_edges": int(len(candidate_df)),
+        "n_edges": int(candidate_workload["n_edges"]),
+        "n_skipped": int(candidate_workload["n_skipped"]),
+        "svd_count_total": int(candidate_workload["svd_count_total"]),
+        "svd_count_own": int(candidate_workload["svd_count_own"]),
+        "svd_count_reduced": int(candidate_workload["svd_count_reduced"]),
+        "svd_count_full": int(candidate_workload["svd_count_full"]),
+        "svd_count_null": int(candidate_workload["svd_count_null"]),
         "n_certified_candidate_group": (
             int(candidate_df["certified_candidate"].sum()) if not candidate_df.empty else 0
         ),

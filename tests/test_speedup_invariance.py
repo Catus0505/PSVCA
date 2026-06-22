@@ -384,3 +384,44 @@ def test_driver_reuses_source_and_surrogate_designs_across_targets(monkeypatch) 
     driver.candidate_group_edges({0: (1, 2), 1: (0, 2)})
 
     assert call_count == 42
+
+
+def test_driver_target_parallelism_preserves_candidate_group_results() -> None:
+    values = make_planted_values(seed=2026)
+    cfg = PairwiseProbeConfig(
+        alphas=(0.01, 0.1, 1.0, 10.0),
+        B=6,
+        seed=2026,
+        null_method="phase",
+        alpha_rule="val_grid",
+        skip_null_on_fail=False,
+    )
+    target_groups = {0: (1, 2, 3), 1: (0, 2, 3), 2: (0, 1, 3), 3: (0, 1, 2)}
+    serial = CertificationDriver(
+        values=values,
+        splits=full_splits(),
+        lookback=6,
+        horizon=1,
+        probe_config=cfg,
+        seed=2026,
+        dataset="speedup_invariance",
+        n_jobs=1,
+    ).candidate_group_edges(target_groups)
+    parallel = CertificationDriver(
+        values=values,
+        splits=full_splits(),
+        lookback=6,
+        horizon=1,
+        probe_config=cfg,
+        seed=2026,
+        dataset="speedup_invariance",
+        n_jobs=4,
+    ).candidate_group_edges(target_groups)
+
+    serial_agg = _aggregate(serial)
+    parallel_agg = _aggregate(parallel)
+    assert _certified_set(parallel_agg) == _certified_set(serial_agg)
+    np.testing.assert_array_equal(
+        parallel["p_value"].to_numpy(dtype=float),
+        serial["p_value"].to_numpy(dtype=float),
+    )

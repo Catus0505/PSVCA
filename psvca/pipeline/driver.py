@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 
 import numpy as np
@@ -219,7 +221,6 @@ class CertificationDriver:
             reduced_cache=self.baseline_cache(target, other_sources),
             surrogate_bank=self.surrogate_bank(target=target, source=source),
             group_id=group_id,
-            n_jobs=self.n_jobs,
             config=self.probe_config,
         )
         row = _result_row(result)
@@ -228,6 +229,30 @@ class CertificationDriver:
         return row
 
     def pairwise_edges(self, targets, *, metadata_for=None) -> pd.DataFrame:
+        targets = tuple(int(target) for target in targets)
+        if self.n_jobs > 1 and len(targets) > 1:
+            tasks = [
+                {
+                    "values": self.values,
+                    "splits": self.splits,
+                    "lookback": self.lookback,
+                    "horizon": self.horizon,
+                    "probe_config": self.probe_config,
+                    "seed": self.seed,
+                    "dataset": self.dataset,
+                    "target": target,
+                    "sources": tuple(source for source in range(self.n_channels) if source != target),
+                    "metadata_by_source": {
+                        source: metadata_for(target, source) if metadata_for else None
+                        for source in range(self.n_channels)
+                        if source != target
+                    },
+                }
+                for target in targets
+            ]
+            rows = _parallel_target_rows(_pairwise_target_task, tasks, self.n_jobs)
+            return pd.DataFrame(rows).sort_values(["target", "source"]).reset_index(drop=True)
+
         rows = []
         for target in targets:
             for source in range(self.n_channels):
@@ -249,11 +274,41 @@ class CertificationDriver:
         *,
         metadata_for=None,
     ) -> pd.DataFrame:
+        normalized_groups = {
+            int(target): tuple(int(s) for s in group_sources if int(s) != int(target))
+            for target, group_sources in target_groups.items()
+        }
+        normalized_groups = {
+            target: group_sources
+            for target, group_sources in normalized_groups.items()
+            if group_sources
+        }
+        if self.n_jobs > 1 and len(normalized_groups) > 1:
+            tasks = [
+                {
+                    "values": self.values,
+                    "splits": self.splits,
+                    "lookback": self.lookback,
+                    "horizon": self.horizon,
+                    "probe_config": self.probe_config,
+                    "seed": self.seed,
+                    "dataset": self.dataset,
+                    "target": target,
+                    "group_sources": group_sources,
+                    "metadata_by_source": {
+                        source: metadata_for(target, source) if metadata_for else None
+                        for source in group_sources
+                    },
+                }
+                for target, group_sources in normalized_groups.items()
+            ]
+            rows = _parallel_target_rows(_candidate_group_target_task, tasks, self.n_jobs)
+            if not rows:
+                return pd.DataFrame()
+            return pd.DataFrame(rows).sort_values(["target", "source"]).reset_index(drop=True)
+
         rows = []
-        for target, group_sources in target_groups.items():
-            group_sources = tuple(int(s) for s in group_sources if int(s) != int(target))
-            if not group_sources:
-                continue
+        for target, group_sources in normalized_groups.items():
             for source in group_sources:
                 other_sources = tuple(s for s in group_sources if s != source)
                 self.baseline_cache(int(target), other_sources)
@@ -320,6 +375,62 @@ def full_group_sources(n_channels: int, *, ref_group_cap: int | None = None) -> 
     return groups
 
 
+def workload_summary(edges: pd.DataFrame, *, mode: str, B: int) -> dict:
+    if edges.empty:
+        return {
+            "n_edges": 0,
+            "n_skipped": 0,
+            "group_size": None,
+            "group_size_min": None,
+            "group_size_max": None,
+            "group_size_mean": None,
+            "svd_count_total": 0,
+            "svd_count_own": 0,
+            "svd_count_reduced": 0,
+            "svd_count_full": 0,
+            "svd_count_null": 0,
+        }
+    n_edges = int(len(edges))
+    n_skipped = int(edges["skipped_null"].fillna(False).astype(bool).sum()) if "skipped_null" in edges else 0
+    n_targets = int(edges["target"].nunique()) if "target" in edges else 0
+    n_null = int((n_edges - n_skipped) * int(B))
+    if "group_size" in edges:
+        group_sizes = edges["group_size"].dropna().astype(int)
+        unique_group_sizes = sorted(group_sizes.unique().tolist())
+        group_size = int(unique_group_sizes[0]) if len(unique_group_sizes) == 1 else None
+        group_size_min = int(group_sizes.min()) if not group_sizes.empty else None
+        group_size_max = int(group_sizes.max()) if not group_sizes.empty else None
+        group_size_mean = float(group_sizes.mean()) if not group_sizes.empty else None
+    else:
+        group_size = None
+        group_size_min = None
+        group_size_max = None
+        group_size_mean = None
+
+    if mode == "candidate_group":
+        n_reduced = n_edges
+        n_full = n_edges
+    elif mode == "pairwise":
+        n_reduced = 0
+        n_full = n_edges
+    else:
+        raise ValueError(f"unsupported workload mode: {mode}")
+    total = n_targets + n_reduced + n_full + n_null
+    return {
+        "n_edges": n_edges,
+        "n_skipped": n_skipped,
+        "group_size": group_size,
+        "group_size_min": group_size_min,
+        "group_size_max": group_size_max,
+        "group_size_mean": group_size_mean,
+        "svd_count_total": int(total),
+        "svd_count_own": int(n_targets),
+        "svd_count_reduced": int(n_reduced),
+        "svd_count_full": int(n_full),
+        "svd_count_null": int(n_null),
+    }
+
+
 def _stack_design(own: np.ndarray, blocks: dict[int, np.ndarray], sources: tuple[int, ...]) -> np.ndarray:
     if not sources:
         return own
@@ -332,3 +443,76 @@ def _result_row(result) -> dict:
     data.pop("alpha_null", None)
     data.setdefault("alpha_rule", "val_grid")
     return data
+
+
+def _parallel_target_rows(fn, tasks: list[dict], n_jobs: int) -> list[dict]:
+    max_workers = min(int(n_jobs), len(tasks))
+    with ProcessPoolExecutor(
+        max_workers=max_workers,
+        initializer=_pin_worker_blas,
+    ) as executor:
+        nested = list(executor.map(fn, tasks))
+    return [row for rows in nested for row in rows]
+
+
+def _pin_worker_blas() -> None:
+    for key in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ[key] = "1"
+
+
+def _driver_from_task(task: dict) -> CertificationDriver:
+    return CertificationDriver(
+        values=task["values"],
+        splits=task["splits"],
+        lookback=task["lookback"],
+        horizon=task["horizon"],
+        probe_config=task["probe_config"],
+        seed=task["seed"],
+        dataset=task["dataset"],
+        n_jobs=1,
+    )
+
+
+def _pairwise_target_task(task: dict) -> list[dict]:
+    driver = _driver_from_task(task)
+    target = int(task["target"])
+    metadata_by_source = task["metadata_by_source"]
+    rows = []
+    for source in task["sources"]:
+        rows.append(
+            driver.probe_pairwise_row(
+                target=target,
+                source=int(source),
+                metadata=metadata_by_source.get(int(source)),
+            )
+        )
+    return rows
+
+
+def _candidate_group_target_task(task: dict) -> list[dict]:
+    driver = _driver_from_task(task)
+    target = int(task["target"])
+    group_sources = tuple(int(source) for source in task["group_sources"])
+    metadata_by_source = task["metadata_by_source"]
+    group_id = f"target_{target}_top{len(group_sources)}"
+    for source in group_sources:
+        other_sources = tuple(s for s in group_sources if s != source)
+        driver.baseline_cache(target, other_sources)
+    rows = []
+    for source in group_sources:
+        rows.append(
+            driver.probe_candidate_group_row(
+                target=target,
+                source=int(source),
+                group_sources=group_sources,
+                group_id=group_id,
+                metadata=metadata_by_source.get(int(source)),
+            )
+        )
+    return rows

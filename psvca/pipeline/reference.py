@@ -24,7 +24,7 @@ from psvca.io.artifacts import ensure_run_dir, get_git_hash, make_run_id
 from psvca.io.schema import SCHEMA_VERSION
 from psvca.linalg.design import make_lagged_design
 from psvca.nulls.phase_surrogate import make_phase_surrogate
-from psvca.pipeline.driver import CertificationDriver, full_group_sources
+from psvca.pipeline.driver import CertificationDriver, full_group_sources, workload_summary
 
 
 # Weather N=21 is allowed for exact all-pair reference. ECL N=321 and
@@ -335,8 +335,11 @@ def run_reference_pipeline(
         ]
         rows = _run_edge_tasks(tasks, n_jobs_eff)
         full_edges = pd.DataFrame(rows).sort_values(["target", "source"]).reset_index(drop=True)
+    certification_mode = "candidate_group" if precompute_own else "pairwise"
+    full_workload = workload_summary(full_edges, mode=certification_mode, B=effective_cfg.B)
     fdr_edges = _apply_bh_fdr_per_target(full_edges, FDRConfig(q=0.1, min_B_for_formal=200))
     block_edges = []
+    block_workloads = []
     for block_splits in _cert_blocks(loaded.splits, max(1, effective_cfg.stability_blocks)):
         if precompute_own:
             block_driver = CertificationDriver(
@@ -357,6 +360,7 @@ def run_reference_pipeline(
             block_tasks = [{**task, "splits": block_splits} for task in tasks]
             block_rows = _run_edge_tasks(block_tasks, n_jobs_eff)
             block_df = pd.DataFrame(block_rows)
+        block_workloads.append(workload_summary(block_df, mode=certification_mode, B=effective_cfg.B))
         block_edges.append(_apply_bh_fdr_per_target(block_df, FDRConfig(q=0.1, min_B_for_formal=200)))
     stable = apply_stability(fdr_edges, block_edges, StabilityConfig()).edges
     aggregate = aggregate_certified_edges(stable).edges
@@ -368,11 +372,43 @@ def run_reference_pipeline(
         "pred_len": int(effective_cfg.pred_len),
         "tier": effective_cfg.tier,
         "n_edges": int(len(aggregate)),
+        "n_skipped": int(
+            full_workload["n_skipped"]
+            + sum(workload["n_skipped"] for workload in block_workloads)
+        ),
+        "n_skipped_main": int(full_workload["n_skipped"]),
+        "n_skipped_blocks": int(sum(workload["n_skipped"] for workload in block_workloads)),
         "n_e_certified": int(aggregate["e_certified"].sum()),
-        "certification_mode": "candidate_group",
+        "certification_mode": certification_mode,
         "group_source": "full",
+        "group_size": full_workload["group_size"],
+        "group_size_min": full_workload["group_size_min"],
+        "group_size_max": full_workload["group_size_max"],
+        "group_size_mean": full_workload["group_size_mean"],
         "ref_group_cap": None if ref_group_cap is None else int(ref_group_cap),
         "effective_B": int(effective_cfg.B),
+        "svd_count_total": int(
+            full_workload["svd_count_total"]
+            + sum(workload["svd_count_total"] for workload in block_workloads)
+        ),
+        "svd_count_main": int(full_workload["svd_count_total"]),
+        "svd_count_blocks": int(sum(workload["svd_count_total"] for workload in block_workloads)),
+        "svd_count_own": int(
+            full_workload["svd_count_own"]
+            + sum(workload["svd_count_own"] for workload in block_workloads)
+        ),
+        "svd_count_reduced": int(
+            full_workload["svd_count_reduced"]
+            + sum(workload["svd_count_reduced"] for workload in block_workloads)
+        ),
+        "svd_count_full": int(
+            full_workload["svd_count_full"]
+            + sum(workload["svd_count_full"] for workload in block_workloads)
+        ),
+        "svd_count_null": int(
+            full_workload["svd_count_null"]
+            + sum(workload["svd_count_null"] for workload in block_workloads)
+        ),
         "N": int(n_channels),
         "m": int(per_target_m),
         "q": float(fdr_q),

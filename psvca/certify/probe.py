@@ -490,10 +490,8 @@ def probe_candidate_group(
     reduced_cache: BaselineFitCache | None = None,
     surrogate_bank=None,
     group_id: str | None = None,
-    n_jobs: int = 1,
     config: PairwiseProbeConfig,
 ) -> CandidateGroupProbeResult:
-    normalize_n_jobs(n_jobs)
     if source == target:
         raise ValueError("target and source must differ for candidate-group probe")
     if source not in group_sources:

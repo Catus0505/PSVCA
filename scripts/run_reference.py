@@ -23,6 +23,7 @@ from psvca.certify.probe import PairwiseProbeConfig, normalize_n_jobs
 from psvca.config import load_config
 from psvca.data.loader import load_series
 from psvca.io.artifacts import ensure_run_dir, make_run_id
+from psvca.pipeline.driver import workload_summary
 from psvca.pipeline.reference import pairwise_edge_task, run_reference_pipeline
 
 
@@ -105,13 +106,22 @@ def main() -> None:
         )
 
     df = pd.DataFrame(rows)
+    workload = workload_summary(df, mode="pairwise", B=cfg.B)
     run_dir = ensure_run_dir(Path("runs") / "phase4_reference", make_run_id(cfg))
     out_path = run_dir / "edges_pairwise.parquet"
     df.to_parquet(out_path, index=False)
 
     p = df["p_value"].to_numpy(dtype=float)
     print("summary:")
+    print(f"  effective_B={int(cfg.B)}")
+    print(f"  group_size={workload['group_size']}")
     print(f"  n_edges={len(df)}")
+    print(f"  n_skipped={int(workload['n_skipped'])}")
+    print(f"  svd_count_total={int(workload['svd_count_total'])}")
+    print(f"  svd_count_own={int(workload['svd_count_own'])}")
+    print(f"  svd_count_reduced={int(workload['svd_count_reduced'])}")
+    print(f"  svd_count_full={int(workload['svd_count_full'])}")
+    print(f"  svd_count_null={int(workload['svd_count_null'])}")
     print(f"  n_certified_candidate={int(df['certified_candidate'].sum())}")
     print(f"  p_value_min={np.nanmin(p):.6g}")
     print(f"  p_value_median={np.nanmedian(p):.6g}")
