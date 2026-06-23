@@ -342,27 +342,41 @@ def run_reference_pipeline(
     fdr_edges = _apply_bh_fdr_per_target(full_edges, FDRConfig(q=0.1, min_B_for_formal=200))
     block_edges = []
     block_workloads = []
-    for block_splits in _cert_blocks(loaded.splits, max(1, effective_cfg.stability_blocks)):
-        if precompute_own:
-            block_driver = CertificationDriver(
-                values=loaded.values,
-                splits=block_splits,
-                lookback=effective_cfg.lookback,
-                horizon=effective_cfg.pred_len,
-                probe_config=probe_cfg,
-                seed=effective_cfg.seed,
-                dataset=effective_cfg.dataset,
-                n_jobs=n_jobs_eff,
-                backend=effective_cfg.backend,
-            )
-            block_df = block_driver.candidate_group_edges(
-                target_groups,
-                metadata_for=_metadata_for(effective_cfg, run_id, git_hash),
-            )
-        else:
-            block_tasks = [{**task, "splits": block_splits} for task in tasks]
-            block_rows = _run_edge_tasks(block_tasks, n_jobs_eff)
-            block_df = pd.DataFrame(block_rows)
+    cert_blocks = _cert_blocks(loaded.splits, max(1, effective_cfg.stability_blocks))
+    if precompute_own and effective_cfg.backend == "gpu":
+        from psvca.gpu.driver_gpu import run_gpu_batch
+
+        block_dfs = run_gpu_batch(
+            driver=driver,
+            target_groups=target_groups,
+            metadata_for=_metadata_for(effective_cfg, run_id, git_hash),
+            cert_splits=tuple(block.cert for block in cert_blocks),
+        )
+    else:
+        block_dfs = []
+        for block_splits in cert_blocks:
+            if precompute_own:
+                block_driver = CertificationDriver(
+                    values=loaded.values,
+                    splits=block_splits,
+                    lookback=effective_cfg.lookback,
+                    horizon=effective_cfg.pred_len,
+                    probe_config=probe_cfg,
+                    seed=effective_cfg.seed,
+                    dataset=effective_cfg.dataset,
+                    n_jobs=n_jobs_eff,
+                    backend=effective_cfg.backend,
+                )
+                block_df = block_driver.candidate_group_edges(
+                    target_groups,
+                    metadata_for=_metadata_for(effective_cfg, run_id, git_hash),
+                )
+            else:
+                block_tasks = [{**task, "splits": block_splits} for task in tasks]
+                block_rows = _run_edge_tasks(block_tasks, n_jobs_eff)
+                block_df = pd.DataFrame(block_rows)
+            block_dfs.append(block_df)
+    for block_df in block_dfs:
         block_workloads.append(workload_summary(block_df, mode=certification_mode, B=effective_cfg.B))
         block_edges.append(_apply_bh_fdr_per_target(block_df, FDRConfig(q=0.1, min_B_for_formal=200)))
     stable = apply_stability(fdr_edges, block_edges, StabilityConfig()).edges

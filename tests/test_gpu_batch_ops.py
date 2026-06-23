@@ -14,8 +14,13 @@ if str(REPO_ROOT) not in sys.path:
 from psvca.gpu.batched_design import batched_lagged_design
 from psvca.gpu.device import resolve_gpu_device
 from psvca.gpu.batched_surrogate import batched_phase_surrogate
+from psvca.gpu.driver_gpu import run_gpu_batch
 from psvca.linalg.design import make_lagged_design
 from psvca.nulls.phase_surrogate import make_phase_surrogate
+from psvca.certify.probe import PairwiseProbeConfig
+from psvca.pipeline.driver import CertificationDriver
+from psvca.pipeline.reference import _cert_blocks
+from scripts.run_synthetic_check import full_splits, make_planted_values
 
 
 pytest.importorskip("torch")
@@ -108,3 +113,61 @@ def test_batched_phase_surrogate_matches_cpu_and_source_seed_order() -> None:
         device="cpu",
     )
     np.testing.assert_allclose(reordered[np.argsort(perm)], actual, rtol=1e-12, atol=1e-12)
+
+
+def test_gpu_cert_blocks_reuse_fit_matches_per_block_gpu() -> None:
+    values = make_planted_values(seed=2026)
+    splits = full_splits()
+    blocks = _cert_blocks(splits, 3)
+    target_groups = {0: (1, 2, 3)}
+    cfg = PairwiseProbeConfig(
+        alphas=(0.01, 0.1, 1.0),
+        B=3,
+        seed=2026,
+        null_method="phase",
+        alpha_rule="val_grid",
+        skip_null_on_fail=False,
+    )
+    driver = CertificationDriver(
+        values=values,
+        splits=splits,
+        lookback=6,
+        horizon=1,
+        probe_config=cfg,
+        seed=2026,
+        dataset="gpu_batch_ops",
+        backend="gpu",
+        gpu_device="cpu",
+    )
+    driver.gpu_dtype = "float64"
+    driver.gpu_chunk = 2
+    batched = run_gpu_batch(
+        driver=driver,
+        target_groups=target_groups,
+        cert_splits=tuple(block.cert for block in blocks),
+    )
+    for block_index, block in enumerate(blocks):
+        per_block = CertificationDriver(
+            values=values,
+            splits=block,
+            lookback=6,
+            horizon=1,
+            probe_config=cfg,
+            seed=2026,
+            dataset="gpu_batch_ops",
+            backend="gpu",
+            gpu_device="cpu",
+        )
+        per_block.gpu_dtype = "float64"
+        per_block.gpu_chunk = 2
+        expected = per_block.candidate_group_edges(target_groups)
+        actual = batched[block_index]
+        assert actual[["target", "source"]].equals(expected[["target", "source"]])
+        np.testing.assert_array_equal(
+            actual["certified_candidate"].to_numpy(bool),
+            expected["certified_candidate"].to_numpy(bool),
+        )
+        np.testing.assert_array_equal(
+            actual["p_value"].to_numpy(float),
+            expected["p_value"].to_numpy(float),
+        )

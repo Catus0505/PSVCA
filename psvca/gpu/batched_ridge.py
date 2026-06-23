@@ -17,6 +17,14 @@ class BatchedRidgeResult:
     pred_cert: np.ndarray
 
 
+@dataclass(frozen=True)
+class BatchedRidgeFit:
+    coef: np.ndarray
+    intercept: np.ndarray
+    alpha_idx: np.ndarray
+    alpha: np.ndarray
+
+
 def _as_index_array(index, name: str) -> np.ndarray:
     arr = np.asarray(index, dtype=np.int64)
     if arr.ndim != 1:
@@ -72,6 +80,8 @@ def batched_ridge_svd(
         raise ValueError("alpha_grid must be a non-empty 1D sequence")
     if np.any(alpha_arr < 0) or not np.all(np.isfinite(alpha_arr)):
         raise ValueError("alpha_grid must contain finite non-negative values")
+    if np.any(alpha_arr < 0) or not np.all(np.isfinite(alpha_arr)):
+        raise ValueError("alpha_grid must contain finite non-negative values")
 
     train = _as_index_array(train_idx, "train_idx")
     val = _as_index_array(val_idx, "val_idx")
@@ -81,28 +91,71 @@ def batched_ridge_svd(
         if np.any(index < 0) or np.any(index >= n_rows):
             raise ValueError(f"{name} contains out-of-bounds rows")
 
-    torch_dtype = torch.float64 if np.dtype(dtype) == np.dtype(np.float64) else torch.float32
-    x = torch.as_tensor(x_arr, dtype=torch_dtype, device=device)
-    target = torch.as_tensor(y_arr, dtype=torch_dtype, device=device)
-    alphas = torch.as_tensor(alpha_arr, dtype=torch_dtype, device=device)
-    train_t = torch.as_tensor(train, dtype=torch.long, device=device)
-    val_t = torch.as_tensor(val, dtype=torch.long, device=device)
-    cert_t = torch.as_tensor(cert, dtype=torch.long, device=device)
+    fit = batched_ridge_fit(
+        X_train=x_arr[:, train],
+        y_train=y_arr[train],
+        X_val=x_arr[:, val],
+        y_val=y_arr[val],
+        alpha_grid=alpha_arr,
+        dtype=dtype,
+        device=device,
+    )
+    pred_cert = predict_batched(fit=fit, X=x_arr[:, cert])
+    r2 = r2_cert_score(y_arr[cert], pred_cert, variance_eps=variance_eps)
+    return BatchedRidgeResult(
+        coef=fit.coef,
+        intercept=fit.intercept,
+        alpha_idx=fit.alpha_idx,
+        alpha=fit.alpha,
+        r2_cert=r2,
+        pred_cert=pred_cert,
+    )
 
-    x_train = x.index_select(1, train_t)
-    y_train = target.index_select(0, train_t)
-    x_val = x.index_select(1, val_t)
-    y_val = target.index_select(0, val_t)
-    x_cert = x.index_select(1, cert_t)
-    y_cert = target.index_select(0, cert_t)
+
+def batched_ridge_fit(
+    *,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    alpha_grid,
+    dtype: str | np.dtype = "float32",
+    device: str | None = None,
+) -> BatchedRidgeFit:
+    import torch
+
+    device = resolve_gpu_device(device=device)
+    train_arr = np.asarray(X_train)
+    val_arr = np.asarray(X_val)
+    y_train_arr = np.asarray(y_train)
+    y_val_arr = np.asarray(y_val)
+    alpha_arr = np.asarray(alpha_grid, dtype=np.float64)
+    if train_arr.ndim != 3 or val_arr.ndim != 3:
+        raise ValueError("X_train and X_val must have shape (batch, rows, cols)")
+    if train_arr.shape[0] != val_arr.shape[0] or train_arr.shape[2] != val_arr.shape[2]:
+        raise ValueError("X_train and X_val batch/column dimensions must match")
+    if train_arr.shape[1] != y_train_arr.shape[0] or val_arr.shape[1] != y_val_arr.shape[0]:
+        raise ValueError("X/y row counts differ")
+    if alpha_arr.ndim != 1 or alpha_arr.size == 0:
+        raise ValueError("alpha_grid must be a non-empty 1D sequence")
+
+    torch_dtype = torch.float64 if np.dtype(dtype) == np.dtype(np.float64) else torch.float32
+    x_train = torch.as_tensor(train_arr, dtype=torch_dtype, device=device)
+    x_val = torch.as_tensor(val_arr, dtype=torch_dtype, device=device)
+    y_train_t = torch.as_tensor(y_train_arr, dtype=torch_dtype, device=device)
+    y_val_t = torch.as_tensor(y_val_arr, dtype=torch_dtype, device=device)
+    alphas = torch.as_tensor(alpha_arr, dtype=torch_dtype, device=device)
 
     x_mean = x_train.mean(dim=1)
-    y_mean = y_train.mean()
+    y_mean = y_train_t.mean()
     x_train_centered = x_train - x_mean[:, None, :]
-    y_train_centered = y_train - y_mean
+    y_train_centered = y_train_t - y_mean
 
     u, s, vh = torch.linalg.svd(x_train_centered, full_matrices=False)
-    uy = torch.matmul(u.transpose(-2, -1), y_train_centered.expand(x.shape[0], -1).unsqueeze(-1)).squeeze(-1)
+    uy = torch.matmul(
+        u.transpose(-2, -1),
+        y_train_centered.expand(x_train.shape[0], -1).unsqueeze(-1),
+    ).squeeze(-1)
     s2 = s * s
 
     eps = torch.finfo(torch_dtype).eps
@@ -123,31 +176,33 @@ def batched_ridge_svd(
     weighted = shrink_t * uy[:, None, :]
     coef_path = torch.matmul(vh.transpose(-2, -1)[:, None, :, :], weighted.unsqueeze(-1)).squeeze(-1)
     intercept_path = y_mean - torch.sum(x_mean[:, None, :] * coef_path, dim=2)
-
     pred_val = torch.einsum("brc,bac->bra", x_val, coef_path) + intercept_path[:, None, :]
-    mse = torch.mean((y_val[None, :, None] - pred_val) ** 2, dim=1)
+    mse = torch.mean((y_val_t[None, :, None] - pred_val) ** 2, dim=1)
     alpha_idx = torch.argmin(mse, dim=1)
 
-    batch_idx = torch.arange(x.shape[0], device=device)
-    coef = coef_path[batch_idx, alpha_idx]
-    intercept = intercept_path[batch_idx, alpha_idx]
-    pred_cert = torch.sum(x_cert * coef[:, None, :], dim=2) + intercept[:, None]
-
-    centered = y_cert - y_cert.mean()
-    sst = torch.sum(centered * centered)
-    sse = torch.sum((y_cert[None, :] - pred_cert) ** 2, dim=1)
-    r2 = torch.where(
-        sst <= torch.as_tensor(float(variance_eps), dtype=torch_dtype, device=device),
-        torch.full_like(sse, float("nan")),
-        1.0 - sse / sst,
-    )
-
+    batch_idx = torch.arange(x_train.shape[0], device=device)
     alpha_idx_np = _tensor_to_numpy(alpha_idx, dtype=np.int64)
-    return BatchedRidgeResult(
-        coef=_tensor_to_numpy(coef),
-        intercept=_tensor_to_numpy(intercept),
+    return BatchedRidgeFit(
+        coef=_tensor_to_numpy(coef_path[batch_idx, alpha_idx]),
+        intercept=_tensor_to_numpy(intercept_path[batch_idx, alpha_idx]),
         alpha_idx=alpha_idx_np,
         alpha=alpha_arr[alpha_idx_np],
-        r2_cert=_tensor_to_numpy(r2),
-        pred_cert=_tensor_to_numpy(pred_cert),
     )
+
+
+def predict_batched(*, fit: BatchedRidgeFit, X: np.ndarray) -> np.ndarray:
+    x_arr = np.asarray(X)
+    if x_arr.ndim != 3:
+        raise ValueError("X must have shape (batch, rows, cols)")
+    return np.einsum("brc,bc->br", x_arr, fit.coef) + fit.intercept[:, None]
+
+
+def r2_cert_score(y_cert: np.ndarray, pred_cert: np.ndarray, *, variance_eps: float) -> np.ndarray:
+    y_arr = np.asarray(y_cert)
+    pred_arr = np.asarray(pred_cert)
+    centered = y_arr - y_arr.mean()
+    sst = float(np.sum(centered * centered))
+    if sst <= float(variance_eps):
+        return np.full(pred_arr.shape[0], float("nan"), dtype=np.float64)
+    sse = np.sum((y_arr[None, :] - pred_arr) ** 2, axis=1)
+    return 1.0 - sse / sst
