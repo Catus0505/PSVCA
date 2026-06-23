@@ -23,6 +23,7 @@ class PSVCAConfig:
     alpha_grid: tuple[float, ...] = (0.001, 0.01, 0.1, 1.0, 10.0)
     null_method: str = "phase"
     B: int = 20
+    backend: str = "cpu"
 
 
 def _repo_root() -> Path:
@@ -94,9 +95,12 @@ def load_config(path_or_name: str) -> PSVCAConfig:
         alpha_grid=tuple(float(x) for x in alpha_grid),
         null_method=str(raw["null_method"]),
         B=int(raw["B"]),
+        backend=str(raw.get("backend", "cpu")),
     )
 
 
 def config_hash(cfg: PSVCAConfig) -> str:
-    payload = json.dumps(asdict(cfg), sort_keys=True, separators=(",", ":"))
+    data = asdict(cfg)
+    data.pop("backend", None)
+    payload = json.dumps(data, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]

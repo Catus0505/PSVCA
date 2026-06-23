@@ -5,3 +5,4 @@ pyarrow
 pyyaml
 pytest
 matplotlib
+torch==2.0.1

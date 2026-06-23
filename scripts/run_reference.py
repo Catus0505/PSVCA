@@ -47,6 +47,7 @@ def main() -> None:
     parser.add_argument("--n-jobs", type=int, default=1)
     parser.add_argument("--ref-group-cap", type=int, default=None)
     parser.add_argument("--skip-null-on-fail", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--backend", choices=("cpu", "gpu"), default=None)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -57,6 +58,7 @@ def main() -> None:
             n_jobs=args.n_jobs,
             ref_group_cap=args.ref_group_cap,
             skip_null_on_fail=args.skip_null_on_fail,
+            backend=args.backend,
         )
         print("summary:")
         for key, value in summary.items():

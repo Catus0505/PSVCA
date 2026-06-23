@@ -425,3 +425,42 @@ def test_driver_target_parallelism_preserves_candidate_group_results() -> None:
         parallel["p_value"].to_numpy(dtype=float),
         serial["p_value"].to_numpy(dtype=float),
     )
+
+
+def test_cpu_gpu_backend_equiv() -> None:
+    values = make_planted_values(seed=2026)
+    cfg = PairwiseProbeConfig(
+        alphas=(0.01, 0.1, 1.0, 10.0),
+        B=6,
+        seed=2026,
+        null_method="phase",
+        alpha_rule="val_grid",
+        skip_null_on_fail=False,
+    )
+    target_groups = {0: (1, 2, 3), 1: (0, 2, 3)}
+    cpu = CertificationDriver(
+        values=values,
+        splits=full_splits(),
+        lookback=6,
+        horizon=1,
+        probe_config=cfg,
+        seed=2026,
+        dataset="speedup_invariance",
+        backend="cpu",
+    ).candidate_group_edges(target_groups)
+    gpu = CertificationDriver(
+        values=values,
+        splits=full_splits(),
+        lookback=6,
+        horizon=1,
+        probe_config=cfg,
+        seed=2026,
+        dataset="speedup_invariance",
+        backend="gpu",
+    ).candidate_group_edges(target_groups)
+
+    assert _certified_set(_aggregate(gpu)) == _certified_set(_aggregate(cpu))
+    np.testing.assert_array_equal(
+        gpu["p_value"].to_numpy(dtype=float),
+        cpu["p_value"].to_numpy(dtype=float),
+    )

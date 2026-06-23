@@ -37,6 +37,7 @@ class CertificationDriver:
         seed: int,
         dataset: str,
         n_jobs: int = 1,
+        backend: str = "cpu",
     ) -> None:
         self.values = np.asarray(values, dtype=np.float64)
         self.splits = splits
@@ -46,6 +47,9 @@ class CertificationDriver:
         self.seed = int(seed)
         self.dataset = str(dataset)
         self.n_jobs = int(n_jobs)
+        self.backend = str(backend)
+        if self.backend not in {"cpu", "gpu"}:
+            raise ValueError(f"unsupported backend: {self.backend!r}")
         self.n_channels = int(self.values.shape[1])
         self._own_designs: dict[int, tuple[DesignMatrix, DesignMatrix, DesignMatrix]] = {}
         self._own_caches: dict[int, BaselineFitCache] = {}
@@ -274,6 +278,22 @@ class CertificationDriver:
         *,
         metadata_for=None,
     ) -> pd.DataFrame:
+        if self.backend == "gpu":
+            from psvca.gpu.driver_gpu import run_gpu_batch
+
+            return run_gpu_batch(
+                driver=self,
+                target_groups=target_groups,
+                metadata_for=metadata_for,
+            )
+        return self._candidate_group_edges_cpu(target_groups, metadata_for=metadata_for)
+
+    def _candidate_group_edges_cpu(
+        self,
+        target_groups: dict[int, tuple[int, ...]],
+        *,
+        metadata_for=None,
+    ) -> pd.DataFrame:
         normalized_groups = {
             int(target): tuple(int(s) for s in group_sources if int(s) != int(target))
             for target, group_sources in target_groups.items()
@@ -476,6 +496,7 @@ def _driver_from_task(task: dict) -> CertificationDriver:
         seed=task["seed"],
         dataset=task["dataset"],
         n_jobs=1,
+        backend="cpu",
     )
 
 

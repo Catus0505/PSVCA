@@ -56,11 +56,13 @@ def main() -> None:
     parser.add_argument("--max-targets", type=int, default=5)
     parser.add_argument("--B", type=int, default=None)
     parser.add_argument("--n-jobs", type=int, default=1)
+    parser.add_argument("--backend", choices=("cpu", "gpu"), default=None)
     args = parser.parse_args()
 
     if args.tier != "sanity":
         raise SystemExit("Phase 5 screen certify only supports --tier sanity")
     cfg = load_config(args.config)
+    backend = args.backend or cfg.backend
     loaded = load_series(cfg)
     n_channels = loaded.values.shape[1]
     targets = tuple(range(min(args.max_targets, n_channels)))
@@ -105,6 +107,7 @@ def main() -> None:
         seed=cfg.seed,
         dataset=cfg.dataset,
         n_jobs=n_jobs,
+        backend=backend,
     )
 
     passed = screen.edges[screen.edges["passed_screen"]].copy()
@@ -168,6 +171,7 @@ def main() -> None:
         "dataset": cfg.dataset,
         "pred_len": int(cfg.pred_len),
         "tier": args.tier,
+        "backend": backend,
         "effective_B": int(B),
         "group_size": candidate_workload["group_size"],
         "group_size_min": candidate_workload["group_size_min"],

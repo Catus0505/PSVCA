@@ -271,9 +271,10 @@ def run_reference_pipeline(
     n_jobs: int = 1,
     ref_group_cap: int | None = None,
     skip_null_on_fail: bool = False,
+    backend: str | None = None,
     output_root: str | Path = "runs/phase7_reference",
 ) -> tuple[pd.DataFrame, dict, Path]:
-    effective_cfg = replace(cfg, tier=tier or cfg.tier)
+    effective_cfg = replace(cfg, tier=tier or cfg.tier, backend=backend or cfg.backend)
     n_jobs_eff = normalize_n_jobs(n_jobs)
     loaded = load_series(effective_cfg)
     n_channels = loaded.values.shape[1]
@@ -311,6 +312,7 @@ def run_reference_pipeline(
             seed=effective_cfg.seed,
             dataset=effective_cfg.dataset,
             n_jobs=n_jobs_eff,
+            backend=effective_cfg.backend,
         )
         target_groups = full_group_sources(n_channels, ref_group_cap=ref_group_cap)
         full_edges = driver.candidate_group_edges(
@@ -351,6 +353,7 @@ def run_reference_pipeline(
                 seed=effective_cfg.seed,
                 dataset=effective_cfg.dataset,
                 n_jobs=n_jobs_eff,
+                backend=effective_cfg.backend,
             )
             block_df = block_driver.candidate_group_edges(
                 target_groups,
@@ -380,6 +383,7 @@ def run_reference_pipeline(
         "n_skipped_blocks": int(sum(workload["n_skipped"] for workload in block_workloads)),
         "n_e_certified": int(aggregate["e_certified"].sum()),
         "certification_mode": certification_mode,
+        "backend": effective_cfg.backend,
         "group_source": "full",
         "group_size": full_workload["group_size"],
         "group_size_min": full_workload["group_size_min"],
