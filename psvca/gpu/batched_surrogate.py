@@ -4,6 +4,8 @@ import hashlib
 
 import numpy as np
 
+from psvca.gpu.device import resolve_gpu_device
+
 
 def batched_phase_surrogate(
     x: np.ndarray,
@@ -12,11 +14,13 @@ def batched_phase_surrogate(
     B: int,
     seed: int,
     dtype: str | np.dtype = "float32",
-    device: str = "cuda:0",
+    device: str | None = None,
     assert_cpu_equiv: bool = False,
 ) -> np.ndarray:
     """Batch phase-randomize source series with source/surrogate-id seeds."""
     import torch
+
+    device = resolve_gpu_device(device=device)
 
     arr = np.asarray(x)
     if arr.ndim == 1:

@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from psvca.gpu.device import resolve_gpu_device
+
 
 @dataclass(frozen=True)
 class BatchedRidgeResult:
@@ -44,7 +46,7 @@ def batched_ridge_svd(
     val_idx,
     cert_idx,
     dtype: str | np.dtype = "float32",
-    device: str = "cuda:0",
+    device: str | None = None,
     variance_eps: float = 1e-12,
 ) -> BatchedRidgeResult:
     """Fit a batch of centered ridge models with one SVD per batch item.
@@ -54,6 +56,8 @@ def batched_ridge_svd(
     per-item argmin is selected. Returned predictions and R2 are on cert_idx.
     """
     import torch
+
+    device = resolve_gpu_device(device=device)
 
     x_arr = np.asarray(X)
     y_arr = np.asarray(y)

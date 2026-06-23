@@ -38,6 +38,7 @@ class CertificationDriver:
         dataset: str,
         n_jobs: int = 1,
         backend: str = "cpu",
+        gpu_device: str | None = None,
     ) -> None:
         self.values = np.asarray(values, dtype=np.float64)
         self.splits = splits
@@ -48,6 +49,7 @@ class CertificationDriver:
         self.dataset = str(dataset)
         self.n_jobs = int(n_jobs)
         self.backend = str(backend)
+        self.gpu_device = None if gpu_device is None else str(gpu_device)
         if self.backend not in {"cpu", "gpu"}:
             raise ValueError(f"unsupported backend: {self.backend!r}")
         self.n_channels = int(self.values.shape[1])

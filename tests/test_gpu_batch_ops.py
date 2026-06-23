@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -11,12 +12,24 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from psvca.gpu.batched_design import batched_lagged_design
+from psvca.gpu.device import resolve_gpu_device
 from psvca.gpu.batched_surrogate import batched_phase_surrogate
 from psvca.linalg.design import make_lagged_design
 from psvca.nulls.phase_surrogate import make_phase_surrogate
 
 
 pytest.importorskip("torch")
+
+
+def test_resolve_gpu_device_priority(monkeypatch) -> None:
+    monkeypatch.delenv("PSVCA_GPU_DEVICE", raising=False)
+    assert resolve_gpu_device() == "cuda:0"
+
+    monkeypatch.setenv("PSVCA_GPU_DEVICE", "cuda:1")
+    assert resolve_gpu_device() == "cuda:1"
+    assert resolve_gpu_device(driver=SimpleNamespace(gpu_device="cpu")) == "cpu"
+    assert resolve_gpu_device(driver=SimpleNamespace(gpu_device=None)) == "cuda:1"
+    assert resolve_gpu_device(driver=SimpleNamespace(gpu_device="cuda:2"), device="cpu") == "cpu"
 
 
 def test_batched_lagged_design_matches_cpu_fp64() -> None:

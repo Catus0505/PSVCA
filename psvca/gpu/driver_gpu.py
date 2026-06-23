@@ -9,6 +9,7 @@ import pandas as pd
 from psvca.certify.gates import GateConfig, evaluate_pairwise_gates
 from psvca.certify.probe import CandidateGroupProbeResult
 from psvca.gpu.batched_design import batched_lagged_design
+from psvca.gpu.device import resolve_gpu_device
 from psvca.gpu.batched_ridge import batched_ridge_svd
 from psvca.gpu.batched_surrogate import batched_phase_surrogate
 
@@ -372,7 +373,7 @@ def _gpu_dtype(driver) -> str:
 
 
 def _gpu_device(driver) -> str:
-    return str(getattr(driver, "gpu_device", os.environ.get("PSVCA_GPU_DEVICE", "cuda:0")))
+    return resolve_gpu_device(driver=driver)
 
 
 def _result_row(result: CandidateGroupProbeResult) -> dict:

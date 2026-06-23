@@ -5,6 +5,8 @@ from collections.abc import Sequence
 
 import numpy as np
 
+from psvca.gpu.device import resolve_gpu_device
+
 
 @dataclass(frozen=True)
 class BatchedDesignMatrix:
@@ -25,11 +27,13 @@ def batched_lagged_design(
     *,
     include_own: bool = True,
     dtype: str | np.dtype = "float32",
-    device: str = "cuda:0",
+    device: str | None = None,
     assert_cpu_equiv: bool = False,
 ) -> BatchedDesignMatrix:
     """Construct lagged designs for a batch of series with torch indexing."""
     import torch
+
+    device = resolve_gpu_device(device=device)
 
     arr = np.asarray(values)
     if arr.ndim == 2:
