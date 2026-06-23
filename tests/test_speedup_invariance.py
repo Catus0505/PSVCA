@@ -6,6 +6,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -24,6 +25,14 @@ from psvca.linalg.design import make_lagged_design
 from psvca.nulls.phase_surrogate import make_phase_surrogate
 from psvca.pipeline.driver import CertificationDriver
 from scripts.run_synthetic_check import EDGE_TYPES, full_splits, make_planted_values
+
+
+def _cuda_available() -> bool:
+    try:
+        import torch
+    except ImportError:
+        return False
+    return bool(torch.cuda.is_available())
 
 
 def _own_design(values, target: int, split, lookback: int, horizon: int):
@@ -427,6 +436,7 @@ def test_driver_target_parallelism_preserves_candidate_group_results() -> None:
     )
 
 
+@pytest.mark.skipif(not _cuda_available(), reason="CUDA is not available")
 def test_cpu_gpu_backend_equiv() -> None:
     values = make_planted_values(seed=2026)
     cfg = PairwiseProbeConfig(
