@@ -11,7 +11,7 @@ from psvca.certify.probe import CandidateGroupProbeResult
 from psvca.gpu.batched_design import batched_lagged_design
 from psvca.gpu.device import resolve_gpu_device
 from psvca.gpu.batched_ridge import batched_ridge_fit, batched_ridge_svd, predict_batched, r2_cert_score
-from psvca.gpu.batched_surrogate import batched_phase_surrogate
+from psvca.gpu.batched_surrogate import batched_phase_surrogate_pairs
 
 
 def run_gpu_batch(
@@ -482,31 +482,32 @@ def _null_batches(
     device: str,
 ) -> dict[int, tuple[np.ndarray, np.ndarray]]:
     cfg = driver.probe_config
-    survivor_sources = tuple(int(group_sources[index]) for index in survivors)
-    surrogate_values = batched_phase_surrogate(
-        driver.values[:, survivor_sources].T,
-        source_indices=survivor_sources,
-        B=int(cfg.B),
-        seed=int(driver.seed),
-        dtype=dtype,
-        device=device,
-    )
     pairs = [
-        (int(edge_index), source_pos, int(surrogate_id))
-        for source_pos, edge_index in enumerate(survivors)
+        (int(edge_index), int(surrogate_id))
+        for edge_index in survivors
         for surrogate_id in range(int(cfg.B))
     ]
     rows_total = int(len(y))
     cols_full = int((1 + len(group_sources)) * driver.lookback)
     chunk_size = _gpu_chunk_size(driver, rows_total, cols_full, dtype)
+    surrogate_chunk_size = _gpu_surrogate_chunk_size(driver, chunk_size)
     delta_parts: dict[int, list[float]] = {int(edge_index): [] for edge_index in survivors}
     alpha_parts: dict[int, list[float]] = {int(edge_index): [] for edge_index in survivors}
-    for start in range(0, len(pairs), chunk_size):
-        chunk = pairs[start : start + chunk_size]
+    for start in range(0, len(pairs), min(chunk_size, surrogate_chunk_size)):
+        chunk = pairs[start : start + min(chunk_size, surrogate_chunk_size)]
         values = np.repeat(driver.values[None, :, :], len(chunk), axis=0)
-        for batch_index, (edge_index, source_pos, surrogate_id) in enumerate(chunk):
-            source = int(group_sources[edge_index])
-            values[batch_index, :, source] = surrogate_values[source_pos, surrogate_id]
+        source_indices = np.asarray([int(group_sources[edge_index]) for edge_index, _ in chunk], dtype=np.int64)
+        surrogate_ids = np.asarray([int(surrogate_id) for _, surrogate_id in chunk], dtype=np.int64)
+        surrogate_rows = batched_phase_surrogate_pairs(
+            driver.values[:, source_indices].T,
+            source_indices=source_indices,
+            surrogate_ids=surrogate_ids,
+            seed=int(driver.seed),
+            dtype=dtype,
+            device=device,
+        )
+        for batch_index, (edge_index, _surrogate_id) in enumerate(chunk):
+            values[batch_index, :, int(group_sources[edge_index])] = surrogate_rows[batch_index]
         targets = np.full(len(chunk), int(target), dtype=np.int64)
         null_designs, _ = _design_for_all_splits(
             driver,
@@ -528,7 +529,7 @@ def _null_batches(
             device=device,
             variance_eps=cfg.variance_eps,
         )
-        for batch_index, (edge_index, _source_pos, _surrogate_id) in enumerate(chunk):
+        for batch_index, (edge_index, _surrogate_id) in enumerate(chunk):
             delta_parts[int(edge_index)].append(float(null.r2_cert[batch_index] - reduced_r2[int(edge_index)]))
             alpha_parts[int(edge_index)].append(float(null.alpha[batch_index]))
     return {
@@ -620,33 +621,34 @@ def _null_fit_batches(
     device: str,
 ) -> dict:
     cfg = driver.probe_config
-    survivor_sources = tuple(int(group_sources[index]) for index in survivors)
-    surrogate_values = batched_phase_surrogate(
-        driver.values[:, survivor_sources].T,
-        source_indices=survivor_sources,
-        B=int(cfg.B),
-        seed=int(driver.seed),
-        dtype=dtype,
-        device=device,
-    )
     pairs = [
-        (int(edge_index), source_pos, int(surrogate_id))
-        for source_pos, edge_index in enumerate(survivors)
+        (int(edge_index), int(surrogate_id))
+        for edge_index in survivors
         for surrogate_id in range(int(cfg.B))
     ]
     rows_total = int(len(y_train) + len(y_val))
     cols_full = int((1 + len(group_sources)) * driver.lookback)
     chunk_size = _gpu_chunk_size(driver, rows_total, cols_full, dtype)
+    surrogate_chunk_size = _gpu_surrogate_chunk_size(driver, chunk_size)
     coefs = []
     intercepts = []
     alphas_selected = []
     ordered_pairs = []
-    for start in range(0, len(pairs), chunk_size):
-        chunk = pairs[start : start + chunk_size]
+    for start in range(0, len(pairs), min(chunk_size, surrogate_chunk_size)):
+        chunk = pairs[start : start + min(chunk_size, surrogate_chunk_size)]
         values = np.repeat(driver.values[None, :, :], len(chunk), axis=0)
-        for batch_index, (edge_index, source_pos, surrogate_id) in enumerate(chunk):
-            source = int(group_sources[edge_index])
-            values[batch_index, :, source] = surrogate_values[source_pos, surrogate_id]
+        source_indices = np.asarray([int(group_sources[edge_index]) for edge_index, _ in chunk], dtype=np.int64)
+        surrogate_ids = np.asarray([int(surrogate_id) for _, surrogate_id in chunk], dtype=np.int64)
+        surrogate_rows = batched_phase_surrogate_pairs(
+            driver.values[:, source_indices].T,
+            source_indices=source_indices,
+            surrogate_ids=surrogate_ids,
+            seed=int(driver.seed),
+            dtype=dtype,
+            device=device,
+        )
+        for batch_index, (edge_index, _surrogate_id) in enumerate(chunk):
+            values[batch_index, :, int(group_sources[edge_index])] = surrogate_rows[batch_index]
         targets = np.full(len(chunk), int(target), dtype=np.int64)
         train, _, val, _ = _design_for_train_val(
             driver,
@@ -672,7 +674,6 @@ def _null_fit_batches(
         ordered_pairs.extend(chunk)
     return {
         "pairs": ordered_pairs,
-        "surrogate_values": surrogate_values,
         "coef": np.concatenate(coefs, axis=0) if coefs else np.empty((0, cols_full), dtype=np.float64),
         "intercept": np.concatenate(intercepts, axis=0) if intercepts else np.empty((0,), dtype=np.float64),
         "alpha": np.concatenate(alphas_selected, axis=0) if alphas_selected else np.empty((0,), dtype=np.float64),
@@ -703,16 +704,32 @@ def _eval_null_block(
     rows_total = int(len(y_cert))
     cols_full = int((1 + len(group_sources)) * driver.lookback)
     chunk_size = _gpu_chunk_size(driver, rows_total, cols_full, dtype)
+    surrogate_chunk_size = _gpu_surrogate_chunk_size(driver, chunk_size)
     delta_parts: dict[int, list[float]] = {int(edge_index): [] for edge_index in survivors}
     alpha_parts: dict[int, list[float]] = {int(edge_index): [] for edge_index in survivors}
-    for start in range(0, len(selected), chunk_size):
-        chunk = selected[start : start + chunk_size]
+    for start in range(0, len(selected), min(chunk_size, surrogate_chunk_size)):
+        chunk = selected[start : start + min(chunk_size, surrogate_chunk_size)]
         values = np.repeat(driver.values[None, :, :], len(chunk), axis=0)
         coef = []
         intercept = []
-        for batch_index, (pair_index, (edge_index, source_pos, surrogate_id)) in enumerate(chunk):
-            source = int(group_sources[edge_index])
-            values[batch_index, :, source] = null_fit["surrogate_values"][source_pos, surrogate_id]
+        source_indices = np.asarray(
+            [int(group_sources[edge_index]) for _pair_index, (edge_index, _surrogate_id) in chunk],
+            dtype=np.int64,
+        )
+        surrogate_ids = np.asarray(
+            [int(surrogate_id) for _pair_index, (_edge_index, surrogate_id) in chunk],
+            dtype=np.int64,
+        )
+        surrogate_rows = batched_phase_surrogate_pairs(
+            driver.values[:, source_indices].T,
+            source_indices=source_indices,
+            surrogate_ids=surrogate_ids,
+            seed=int(driver.seed),
+            dtype=dtype,
+            device=device,
+        )
+        for batch_index, (pair_index, (edge_index, _surrogate_id)) in enumerate(chunk):
+            values[batch_index, :, int(group_sources[edge_index])] = surrogate_rows[batch_index]
             coef.append(null_fit["coef"][pair_index])
             intercept.append(null_fit["intercept"][pair_index])
         targets = np.full(len(chunk), int(target), dtype=np.int64)
@@ -728,7 +745,7 @@ def _eval_null_block(
         )
         pred = np.einsum("brc,bc->br", cert.X, np.asarray(coef)) + np.asarray(intercept)[:, None]
         r2 = r2_cert_score(y_cert, pred, variance_eps=driver.probe_config.variance_eps)
-        for batch_index, (pair_index, (edge_index, _source_pos, _surrogate_id)) in enumerate(chunk):
+        for batch_index, (pair_index, (edge_index, _surrogate_id)) in enumerate(chunk):
             delta_parts[int(edge_index)].append(float(r2[batch_index] - reduced_r2[int(edge_index)]))
             alpha_parts[int(edge_index)].append(float(null_fit["alpha"][pair_index]))
     return {
@@ -836,6 +853,16 @@ def _gpu_chunk_size(driver, rows: int, cols: int, dtype: str) -> int:
     six_gib = 6 * 1024**3
     by_matrix_bytes = max(1, int(rows) * int(cols) * bytes_per)
     return max(1, min(64, six_gib // by_matrix_bytes))
+
+
+def _gpu_surrogate_chunk_size(driver, fallback: int) -> int:
+    raw = getattr(driver, "gpu_surrogate_chunk", os.environ.get("PSVCA_GPU_SURROGATE_CHUNK"))
+    if raw is None:
+        return max(1, int(fallback))
+    chunk = int(raw)
+    if chunk <= 0:
+        raise ValueError("PSVCA_GPU_SURROGATE_CHUNK must be positive")
+    return chunk
 
 
 def _gpu_dtype(driver) -> str:
