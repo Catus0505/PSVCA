@@ -14,7 +14,13 @@ if str(REPO_ROOT) not in sys.path:
 from psvca.gpu.batched_design import batched_lagged_design
 from psvca.gpu.device import resolve_gpu_device
 from psvca.gpu.batched_surrogate import batched_phase_surrogate, batched_phase_surrogate_pairs
-from psvca.gpu.driver_gpu import run_gpu_batch
+from psvca.gpu.driver_gpu import (
+    _assign_surrogate_rows,
+    _n_design_rows,
+    _split_indices,
+    _target_full_cert_fits_by_edge_subbatch,
+    run_gpu_batch,
+)
 from psvca.linalg.design import make_lagged_design
 from psvca.nulls.phase_surrogate import make_phase_surrogate
 from psvca.certify.probe import PairwiseProbeConfig
@@ -149,6 +155,140 @@ def test_batched_phase_surrogate_pairs_matches_full_grid_and_cpu() -> None:
             rtol=1e-12,
             atol=1e-12,
         )
+
+
+def test_vectorized_surrogate_fill_matches_python_loop() -> None:
+    rng = np.random.default_rng(321)
+    values_loop = np.zeros((7, 11, 5), dtype=np.float64)
+    values_vec = values_loop.copy()
+    source_cols = np.asarray([3, 1, 4, 0, 2, 3, 1], dtype=np.int64)
+    surrogate_rows = rng.normal(size=(7, 11))
+
+    for batch_index, source_col in enumerate(source_cols):
+        values_loop[batch_index, :, int(source_col)] = surrogate_rows[batch_index]
+    _assign_surrogate_rows(values_vec, source_cols, surrogate_rows)
+
+    np.testing.assert_array_equal(values_vec, values_loop)
+
+
+def test_edge_subbatch_design_and_svd_match_full_batch() -> None:
+    rng = np.random.default_rng(654)
+    values = rng.normal(size=(360, 21))
+    group_sources = tuple(range(1, 21))
+    cfg = PairwiseProbeConfig(
+        alphas=(0.01, 0.1, 1.0),
+        B=2,
+        seed=2026,
+        null_method="phase",
+        alpha_rule="val_grid",
+        skip_null_on_fail=False,
+    )
+    driver = CertificationDriver(
+        values=values,
+        splits=full_splits(),
+        lookback=6,
+        horizon=1,
+        probe_config=cfg,
+        seed=2026,
+        dataset="gpu_batch_ops",
+        backend="gpu",
+        gpu_device="cpu",
+    )
+    driver.gpu_dtype = "float64"
+    train_idx, val_idx, cert_idx = _split_indices(
+        _n_design_rows(driver, driver.splits.train_fit),
+        _n_design_rows(driver, driver.splits.val_alpha),
+        _n_design_rows(driver, driver.splits.cert),
+    )
+    reduced_sources = [tuple(s for s in group_sources if s != source) for source in group_sources]
+    full_sources = [group_sources for _ in group_sources]
+    source_only = [(source,) for source in group_sources]
+
+    driver.gpu_edge_subbatch = 64
+    reference = _target_full_cert_fits_by_edge_subbatch(
+        driver,
+        target=0,
+        group_sources=group_sources,
+        reduced_sources=reduced_sources,
+        full_sources=full_sources,
+        source_only=source_only,
+        train_idx=train_idx,
+        val_idx=val_idx,
+        cert_idx=cert_idx,
+        alphas=np.asarray(cfg.alphas, dtype=np.float64),
+        dtype="float64",
+        device="cpu",
+        variance_eps=cfg.variance_eps,
+    )
+
+    for subbatch in (4, 3):
+        driver.gpu_edge_subbatch = subbatch
+        actual = _target_full_cert_fits_by_edge_subbatch(
+            driver,
+            target=0,
+            group_sources=group_sources,
+            reduced_sources=reduced_sources,
+            full_sources=full_sources,
+            source_only=source_only,
+            train_idx=train_idx,
+            val_idx=val_idx,
+            cert_idx=cert_idx,
+            alphas=np.asarray(cfg.alphas, dtype=np.float64),
+            dtype="float64",
+            device="cpu",
+            variance_eps=cfg.variance_eps,
+        )
+        for actual_ridge, expected_ridge in ((actual[0], reference[0]), (actual[1], reference[1])):
+            np.testing.assert_array_equal(actual_ridge.coef, expected_ridge.coef)
+            np.testing.assert_array_equal(actual_ridge.intercept, expected_ridge.intercept)
+            np.testing.assert_array_equal(actual_ridge.alpha_idx, expected_ridge.alpha_idx)
+            np.testing.assert_array_equal(actual_ridge.alpha, expected_ridge.alpha)
+            np.testing.assert_array_equal(actual_ridge.r2_cert, expected_ridge.r2_cert)
+            np.testing.assert_array_equal(actual_ridge.pred_cert, expected_ridge.pred_cert)
+        np.testing.assert_array_equal(actual[2], reference[2])
+        np.testing.assert_array_equal(actual[3], reference[3])
+
+
+def test_gpu_edge_subbatch_preserves_candidate_group_results() -> None:
+    values = make_planted_values(seed=2026)
+    cfg = PairwiseProbeConfig(
+        alphas=(0.01, 0.1, 1.0),
+        B=4,
+        seed=2026,
+        null_method="phase",
+        alpha_rule="val_grid",
+        skip_null_on_fail=False,
+    )
+    target_groups = {0: (1, 2, 3)}
+
+    def run_with_edge_subbatch(subbatch: int):
+        driver = CertificationDriver(
+            values=values,
+            splits=full_splits(),
+            lookback=6,
+            horizon=1,
+            probe_config=cfg,
+            seed=2026,
+            dataset="gpu_batch_ops",
+            backend="gpu",
+            gpu_device="cpu",
+        )
+        driver.gpu_dtype = "float64"
+        driver.gpu_chunk = 3
+        driver.gpu_edge_subbatch = subbatch
+        return driver.candidate_group_edges(target_groups)
+
+    reference = run_with_edge_subbatch(64)
+    chunked = run_with_edge_subbatch(2)
+    assert chunked[["target", "source"]].equals(reference[["target", "source"]])
+    np.testing.assert_array_equal(
+        chunked["certified_candidate"].to_numpy(bool),
+        reference["certified_candidate"].to_numpy(bool),
+    )
+    np.testing.assert_array_equal(
+        chunked["p_value"].to_numpy(float),
+        reference["p_value"].to_numpy(float),
+    )
 
 
 def test_gpu_cert_blocks_reuse_fit_matches_per_block_gpu() -> None:

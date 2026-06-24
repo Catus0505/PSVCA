@@ -10,7 +10,14 @@ from psvca.certify.gates import GateConfig, evaluate_pairwise_gates
 from psvca.certify.probe import CandidateGroupProbeResult
 from psvca.gpu.batched_design import batched_lagged_design
 from psvca.gpu.device import resolve_gpu_device
-from psvca.gpu.batched_ridge import batched_ridge_fit, batched_ridge_svd, predict_batched, r2_cert_score
+from psvca.gpu.batched_ridge import (
+    BatchedRidgeFit,
+    BatchedRidgeResult,
+    batched_ridge_fit,
+    batched_ridge_svd,
+    predict_batched,
+    r2_cert_score,
+)
 from psvca.gpu.batched_surrogate import batched_phase_surrogate_pairs
 
 
@@ -58,9 +65,6 @@ def run_gpu_batch(
 
 
 def _target_rows(driver, target: int, group_sources: tuple[int, ...], *, metadata_for=None) -> list[dict]:
-    n_edges = len(group_sources)
-    base_values = np.repeat(driver.values[None, :, :], n_edges, axis=0)
-    targets = np.full(n_edges, int(target), dtype=np.int64)
     train_idx, val_idx, cert_idx = _split_indices(
         _n_design_rows(driver, driver.splits.train_fit),
         _n_design_rows(driver, driver.splits.val_alpha),
@@ -79,60 +83,22 @@ def _target_rows(driver, target: int, group_sources: tuple[int, ...], *, metadat
     reduced_sources = [tuple(s for s in group_sources if s != source) for source in group_sources]
     full_sources = [group_sources for _ in group_sources]
     source_only = [(source,) for source in group_sources]
-    reduced_designs, y = _design_for_all_splits(
+    reduced, full, source_cert, y = _target_full_cert_fits_by_edge_subbatch(
         driver,
-        base_values,
-        targets,
-        reduced_sources,
-        include_own=True,
+        target=int(target),
+        group_sources=group_sources,
+        reduced_sources=reduced_sources,
+        full_sources=full_sources,
+        source_only=source_only,
+        train_idx=train_idx,
+        val_idx=val_idx,
+        cert_idx=cert_idx,
+        alphas=alphas,
         dtype=gpu_dtype,
         device=gpu_device,
+        variance_eps=cfg.variance_eps,
     )
     y_cert = y[cert_idx]
-    full_designs, _ = _design_for_all_splits(
-        driver,
-        base_values,
-        targets,
-        full_sources,
-        include_own=True,
-        dtype=gpu_dtype,
-        device=gpu_device,
-    )
-    source_cert = batched_lagged_design(
-        base_values,
-        targets,
-        source_only,
-        driver.lookback,
-        driver.horizon,
-        int(driver.splits.cert.start),
-        int(driver.splits.cert.end),
-        include_own=False,
-        dtype=gpu_dtype,
-        device=gpu_device,
-    ).X
-
-    reduced = batched_ridge_svd(
-        reduced_designs,
-        y,
-        alphas,
-        train_idx=train_idx,
-        val_idx=val_idx,
-        cert_idx=cert_idx,
-        dtype=gpu_dtype,
-        device=gpu_device,
-        variance_eps=cfg.variance_eps,
-    )
-    full = batched_ridge_svd(
-        full_designs,
-        y,
-        alphas,
-        train_idx=train_idx,
-        val_idx=val_idx,
-        cert_idx=cert_idx,
-        dtype=gpu_dtype,
-        device=gpu_device,
-        variance_eps=cfg.variance_eps,
-    )
 
     delta_true = full.r2_cert - reduced.r2_cert
     survivors = [
@@ -226,6 +192,249 @@ def _target_rows(driver, target: int, group_sources: tuple[int, ...], *, metadat
     return rows
 
 
+def _target_full_cert_fits_by_edge_subbatch(
+    driver,
+    *,
+    target: int,
+    group_sources: tuple[int, ...],
+    reduced_sources,
+    full_sources,
+    source_only,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    cert_idx: np.ndarray,
+    alphas: np.ndarray,
+    dtype: str,
+    device: str,
+    variance_eps: float,
+) -> tuple[BatchedRidgeResult, BatchedRidgeResult, np.ndarray, np.ndarray]:
+    reduced_parts = []
+    full_parts = []
+    source_cert_parts = []
+    y_ref = None
+    subbatch = _gpu_edge_subbatch_size(driver)
+    for start, end in _edge_subbatch_ranges(len(group_sources), subbatch):
+        batch_size = end - start
+        values = np.repeat(driver.values[None, :, :], batch_size, axis=0)
+        targets = np.full(batch_size, int(target), dtype=np.int64)
+        reduced_designs, y = _design_for_all_splits(
+            driver,
+            values,
+            targets,
+            reduced_sources[start:end],
+            include_own=True,
+            dtype=dtype,
+            device=device,
+        )
+        if y_ref is None:
+            y_ref = y
+        elif not np.array_equal(y_ref, y):
+            raise ValueError("edge sub-batches for one target must share y")
+        full_designs, _ = _design_for_all_splits(
+            driver,
+            values,
+            targets,
+            full_sources[start:end],
+            include_own=True,
+            dtype=dtype,
+            device=device,
+        )
+        source_cert_parts.append(
+            batched_lagged_design(
+                values,
+                targets,
+                source_only[start:end],
+                driver.lookback,
+                driver.horizon,
+                int(driver.splits.cert.start),
+                int(driver.splits.cert.end),
+                include_own=False,
+                dtype=dtype,
+                device=device,
+            ).X
+        )
+        reduced_parts.append(
+            batched_ridge_svd(
+                reduced_designs,
+                y,
+                alphas,
+                train_idx=train_idx,
+                val_idx=val_idx,
+                cert_idx=cert_idx,
+                dtype=dtype,
+                device=device,
+                variance_eps=variance_eps,
+            )
+        )
+        full_parts.append(
+            batched_ridge_svd(
+                full_designs,
+                y,
+                alphas,
+                train_idx=train_idx,
+                val_idx=val_idx,
+                cert_idx=cert_idx,
+                dtype=dtype,
+                device=device,
+                variance_eps=variance_eps,
+            )
+        )
+        del reduced_designs, full_designs, values
+    if y_ref is None:
+        raise ValueError("group_sources must not be empty")
+    return (
+        _concat_ridge_results(reduced_parts),
+        _concat_ridge_results(full_parts),
+        np.concatenate(source_cert_parts, axis=0),
+        y_ref,
+    )
+
+
+def _target_train_val_fits_by_edge_subbatch(
+    driver,
+    *,
+    target: int,
+    group_sources: tuple[int, ...],
+    reduced_sources,
+    full_sources,
+    alphas: np.ndarray,
+    dtype: str,
+    device: str,
+) -> tuple[BatchedRidgeFit, BatchedRidgeFit, np.ndarray, np.ndarray]:
+    reduced_parts = []
+    full_parts = []
+    y_train_ref = None
+    y_val_ref = None
+    subbatch = _gpu_edge_subbatch_size(driver)
+    for start, end in _edge_subbatch_ranges(len(group_sources), subbatch):
+        batch_size = end - start
+        values = np.repeat(driver.values[None, :, :], batch_size, axis=0)
+        targets = np.full(batch_size, int(target), dtype=np.int64)
+        reduced_train, y_train, reduced_val, y_val = _design_for_train_val(
+            driver,
+            values,
+            targets,
+            reduced_sources[start:end],
+            include_own=True,
+            dtype=dtype,
+            device=device,
+        )
+        if y_train_ref is None:
+            y_train_ref = y_train
+            y_val_ref = y_val
+        elif not (np.array_equal(y_train_ref, y_train) and np.array_equal(y_val_ref, y_val)):
+            raise ValueError("edge sub-batches for one target must share train/val y")
+        full_train, _, full_val, _ = _design_for_train_val(
+            driver,
+            values,
+            targets,
+            full_sources[start:end],
+            include_own=True,
+            dtype=dtype,
+            device=device,
+        )
+        reduced_parts.append(
+            batched_ridge_fit(
+                X_train=reduced_train,
+                y_train=y_train,
+                X_val=reduced_val,
+                y_val=y_val,
+                alpha_grid=alphas,
+                dtype=dtype,
+                device=device,
+            )
+        )
+        full_parts.append(
+            batched_ridge_fit(
+                X_train=full_train,
+                y_train=y_train,
+                X_val=full_val,
+                y_val=y_val,
+                alpha_grid=alphas,
+                dtype=dtype,
+                device=device,
+            )
+        )
+        del reduced_train, reduced_val, full_train, full_val, values
+    if y_train_ref is None or y_val_ref is None:
+        raise ValueError("group_sources must not be empty")
+    return _concat_ridge_fits(reduced_parts), _concat_ridge_fits(full_parts), y_train_ref, y_val_ref
+
+
+def _target_cert_metrics_by_edge_subbatch(
+    driver,
+    *,
+    target: int,
+    group_sources: tuple[int, ...],
+    reduced_sources,
+    full_sources,
+    source_only,
+    cert_split,
+    reduced_fit: BatchedRidgeFit,
+    full_fit: BatchedRidgeFit,
+    dtype: str,
+    device: str,
+    variance_eps: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    source_cert_parts = []
+    reduced_r2_parts = []
+    full_r2_parts = []
+    y_cert_ref = None
+    subbatch = _gpu_edge_subbatch_size(driver)
+    for start, end in _edge_subbatch_ranges(len(group_sources), subbatch):
+        batch_size = end - start
+        values = np.repeat(driver.values[None, :, :], batch_size, axis=0)
+        targets = np.full(batch_size, int(target), dtype=np.int64)
+        reduced_cert = _design_for_cert_split(
+            driver,
+            values,
+            targets,
+            reduced_sources[start:end],
+            cert_split,
+            include_own=True,
+            dtype=dtype,
+            device=device,
+        )
+        if y_cert_ref is None:
+            y_cert_ref = reduced_cert.y[0]
+        elif not np.array_equal(y_cert_ref, reduced_cert.y[0]):
+            raise ValueError("edge sub-batches for one target must share cert y")
+        full_cert = _design_for_cert_split(
+            driver,
+            values,
+            targets,
+            full_sources[start:end],
+            cert_split,
+            include_own=True,
+            dtype=dtype,
+            device=device,
+        )
+        source_cert_parts.append(
+            batched_lagged_design(
+                values,
+                targets,
+                source_only[start:end],
+                driver.lookback,
+                driver.horizon,
+                int(cert_split.start),
+                int(cert_split.end),
+                include_own=False,
+                dtype=dtype,
+                device=device,
+            ).X
+        )
+        reduced_pred = predict_batched(fit=_slice_ridge_fit(reduced_fit, start, end), X=reduced_cert.X)
+        full_pred = predict_batched(fit=_slice_ridge_fit(full_fit, start, end), X=full_cert.X)
+        reduced_r2_parts.append(r2_cert_score(y_cert_ref, reduced_pred, variance_eps=variance_eps))
+        full_r2_parts.append(r2_cert_score(y_cert_ref, full_pred, variance_eps=variance_eps))
+        del reduced_cert, full_cert, values
+    if y_cert_ref is None:
+        raise ValueError("group_sources must not be empty")
+    reduced_r2 = np.concatenate(reduced_r2_parts, axis=0)
+    full_r2 = np.concatenate(full_r2_parts, axis=0)
+    return y_cert_ref, np.concatenate(source_cert_parts, axis=0), reduced_r2, full_r2 - reduced_r2
+
+
 def _target_block_rows(
     driver,
     target: int,
@@ -234,9 +443,6 @@ def _target_block_rows(
     cert_splits,
     metadata_for=None,
 ) -> list[list[dict]]:
-    n_edges = len(group_sources)
-    base_values = np.repeat(driver.values[None, :, :], n_edges, axis=0)
-    targets = np.full(n_edges, int(target), dtype=np.int64)
     cfg = driver.probe_config
     if cfg.alpha_rule != "val_grid":
         raise ValueError(f"GPU batched ridge supports alpha_rule='val_grid', got {cfg.alpha_rule!r}")
@@ -250,39 +456,13 @@ def _target_block_rows(
     reduced_sources = [tuple(s for s in group_sources if s != source) for source in group_sources]
     full_sources = [group_sources for _ in group_sources]
     source_only = [(source,) for source in group_sources]
-    reduced_train, y_train, reduced_val, y_val = _design_for_train_val(
+    reduced_fit, full_fit, y_train, y_val = _target_train_val_fits_by_edge_subbatch(
         driver,
-        base_values,
-        targets,
-        reduced_sources,
-        include_own=True,
-        dtype=gpu_dtype,
-        device=gpu_device,
-    )
-    full_train, _, full_val, _ = _design_for_train_val(
-        driver,
-        base_values,
-        targets,
-        full_sources,
-        include_own=True,
-        dtype=gpu_dtype,
-        device=gpu_device,
-    )
-    reduced_fit = batched_ridge_fit(
-        X_train=reduced_train,
-        y_train=y_train,
-        X_val=reduced_val,
-        y_val=y_val,
-        alpha_grid=alphas,
-        dtype=gpu_dtype,
-        device=gpu_device,
-    )
-    full_fit = batched_ridge_fit(
-        X_train=full_train,
-        y_train=y_train,
-        X_val=full_val,
-        y_val=y_val,
-        alpha_grid=alphas,
+        target=int(target),
+        group_sources=group_sources,
+        reduced_sources=reduced_sources,
+        full_sources=full_sources,
+        alphas=alphas,
         dtype=gpu_dtype,
         device=gpu_device,
     )
@@ -290,44 +470,20 @@ def _target_block_rows(
     block_state = []
     union_survivors: set[int] = set()
     for cert_split in cert_splits:
-        reduced_cert = _design_for_cert_split(
+        y_cert, source_cert, reduced_r2, delta_true = _target_cert_metrics_by_edge_subbatch(
             driver,
-            base_values,
-            targets,
-            reduced_sources,
-            cert_split,
-            include_own=True,
+            target=int(target),
+            group_sources=group_sources,
+            reduced_sources=reduced_sources,
+            full_sources=full_sources,
+            source_only=source_only,
+            cert_split=cert_split,
+            reduced_fit=reduced_fit,
+            full_fit=full_fit,
             dtype=gpu_dtype,
             device=gpu_device,
+            variance_eps=cfg.variance_eps,
         )
-        full_cert = _design_for_cert_split(
-            driver,
-            base_values,
-            targets,
-            full_sources,
-            cert_split,
-            include_own=True,
-            dtype=gpu_dtype,
-            device=gpu_device,
-        )
-        source_cert = batched_lagged_design(
-            base_values,
-            targets,
-            source_only,
-            driver.lookback,
-            driver.horizon,
-            int(cert_split.start),
-            int(cert_split.end),
-            include_own=False,
-            dtype=gpu_dtype,
-            device=gpu_device,
-        )
-        y_cert = reduced_cert.y[0]
-        reduced_pred = predict_batched(fit=reduced_fit, X=reduced_cert.X)
-        full_pred = predict_batched(fit=full_fit, X=full_cert.X)
-        reduced_r2 = r2_cert_score(y_cert, reduced_pred, variance_eps=cfg.variance_eps)
-        full_r2 = r2_cert_score(y_cert, full_pred, variance_eps=cfg.variance_eps)
-        delta_true = full_r2 - reduced_r2
         survivors = [
             int(i)
             for i, delta in enumerate(delta_true)
@@ -338,7 +494,7 @@ def _target_block_rows(
             {
                 "cert_split": cert_split,
                 "y_cert": y_cert,
-                "source_cert": source_cert.X,
+                "source_cert": source_cert,
                 "reduced_r2": reduced_r2,
                 "delta_true": delta_true,
                 "survivors": survivors,
@@ -506,8 +662,7 @@ def _null_batches(
             dtype=dtype,
             device=device,
         )
-        for batch_index, (edge_index, _surrogate_id) in enumerate(chunk):
-            values[batch_index, :, int(group_sources[edge_index])] = surrogate_rows[batch_index]
+        _assign_surrogate_rows(values, source_indices, surrogate_rows)
         targets = np.full(len(chunk), int(target), dtype=np.int64)
         null_designs, _ = _design_for_all_splits(
             driver,
@@ -647,8 +802,7 @@ def _null_fit_batches(
             dtype=dtype,
             device=device,
         )
-        for batch_index, (edge_index, _surrogate_id) in enumerate(chunk):
-            values[batch_index, :, int(group_sources[edge_index])] = surrogate_rows[batch_index]
+        _assign_surrogate_rows(values, source_indices, surrogate_rows)
         targets = np.full(len(chunk), int(target), dtype=np.int64)
         train, _, val, _ = _design_for_train_val(
             driver,
@@ -728,8 +882,8 @@ def _eval_null_block(
             dtype=dtype,
             device=device,
         )
-        for batch_index, (pair_index, (edge_index, _surrogate_id)) in enumerate(chunk):
-            values[batch_index, :, int(group_sources[edge_index])] = surrogate_rows[batch_index]
+        _assign_surrogate_rows(values, source_indices, surrogate_rows)
+        for pair_index, (_edge_index, _surrogate_id) in chunk:
             coef.append(null_fit["coef"][pair_index])
             intercept.append(null_fit["intercept"][pair_index])
         targets = np.full(len(chunk), int(target), dtype=np.int64)
@@ -863,6 +1017,60 @@ def _gpu_surrogate_chunk_size(driver, fallback: int) -> int:
     if chunk <= 0:
         raise ValueError("PSVCA_GPU_SURROGATE_CHUNK must be positive")
     return chunk
+
+
+def _gpu_edge_subbatch_size(driver) -> int:
+    raw = getattr(driver, "gpu_edge_subbatch", os.environ.get("PSVCA_GPU_EDGE_SUBBATCH", 4))
+    subbatch = int(raw)
+    if subbatch <= 0:
+        raise ValueError("PSVCA_GPU_EDGE_SUBBATCH must be positive")
+    return subbatch
+
+
+def _edge_subbatch_ranges(n_edges: int, subbatch: int):
+    for start in range(0, int(n_edges), int(subbatch)):
+        yield start, min(start + int(subbatch), int(n_edges))
+
+
+def _assign_surrogate_rows(values: np.ndarray, source_cols: np.ndarray, surrogate_rows: np.ndarray) -> None:
+    cols = np.asarray(source_cols, dtype=np.int64)
+    rows = np.asarray(surrogate_rows)
+    if values.shape[0] != cols.shape[0] or rows.shape[0] != cols.shape[0]:
+        raise ValueError("surrogate fill batch dimensions differ")
+    values[np.arange(cols.shape[0]), :, cols] = rows
+
+
+def _concat_ridge_results(parts: list[BatchedRidgeResult]) -> BatchedRidgeResult:
+    if not parts:
+        raise ValueError("cannot concatenate empty ridge result list")
+    return BatchedRidgeResult(
+        coef=np.concatenate([part.coef for part in parts], axis=0),
+        intercept=np.concatenate([part.intercept for part in parts], axis=0),
+        alpha_idx=np.concatenate([part.alpha_idx for part in parts], axis=0),
+        alpha=np.concatenate([part.alpha for part in parts], axis=0),
+        r2_cert=np.concatenate([part.r2_cert for part in parts], axis=0),
+        pred_cert=np.concatenate([part.pred_cert for part in parts], axis=0),
+    )
+
+
+def _concat_ridge_fits(parts: list[BatchedRidgeFit]) -> BatchedRidgeFit:
+    if not parts:
+        raise ValueError("cannot concatenate empty ridge fit list")
+    return BatchedRidgeFit(
+        coef=np.concatenate([part.coef for part in parts], axis=0),
+        intercept=np.concatenate([part.intercept for part in parts], axis=0),
+        alpha_idx=np.concatenate([part.alpha_idx for part in parts], axis=0),
+        alpha=np.concatenate([part.alpha for part in parts], axis=0),
+    )
+
+
+def _slice_ridge_fit(fit: BatchedRidgeFit, start: int, end: int) -> BatchedRidgeFit:
+    return BatchedRidgeFit(
+        coef=fit.coef[start:end],
+        intercept=fit.intercept[start:end],
+        alpha_idx=fit.alpha_idx[start:end],
+        alpha=fit.alpha[start:end],
+    )
 
 
 def _gpu_dtype(driver) -> str:
