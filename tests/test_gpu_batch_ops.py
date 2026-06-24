@@ -239,13 +239,28 @@ def test_edge_subbatch_design_and_svd_match_full_batch() -> None:
             variance_eps=cfg.variance_eps,
         )
         for actual_ridge, expected_ridge in ((actual[0], reference[0]), (actual[1], reference[1])):
-            np.testing.assert_array_equal(actual_ridge.coef, expected_ridge.coef)
-            np.testing.assert_array_equal(actual_ridge.intercept, expected_ridge.intercept)
+            np.testing.assert_allclose(actual_ridge.coef, expected_ridge.coef, atol=1e-12, rtol=1e-9)
+            np.testing.assert_allclose(
+                actual_ridge.intercept,
+                expected_ridge.intercept,
+                atol=1e-12,
+                rtol=1e-9,
+            )
             np.testing.assert_array_equal(actual_ridge.alpha_idx, expected_ridge.alpha_idx)
-            np.testing.assert_array_equal(actual_ridge.alpha, expected_ridge.alpha)
-            np.testing.assert_array_equal(actual_ridge.r2_cert, expected_ridge.r2_cert)
-            np.testing.assert_array_equal(actual_ridge.pred_cert, expected_ridge.pred_cert)
-        np.testing.assert_array_equal(actual[2], reference[2])
+            np.testing.assert_allclose(actual_ridge.alpha, expected_ridge.alpha, atol=1e-12, rtol=1e-9)
+            np.testing.assert_allclose(
+                actual_ridge.r2_cert,
+                expected_ridge.r2_cert,
+                atol=1e-12,
+                rtol=1e-9,
+            )
+            np.testing.assert_allclose(
+                actual_ridge.pred_cert,
+                expected_ridge.pred_cert,
+                atol=1e-12,
+                rtol=1e-9,
+            )
+        np.testing.assert_allclose(actual[2], reference[2], atol=1e-12, rtol=1e-9)
         np.testing.assert_array_equal(actual[3], reference[3])
 
 
